@@ -21,6 +21,7 @@
 #include <chrono>
 #include <stdexcept>
 #include <string_view>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -980,6 +981,157 @@ namespace
 
         using Map = std::unordered_map<Decode, int, Hash>;
     };
+
+    class FrequencyTracker
+    {
+    public:
+
+        void reset(double initial_hz,
+                   double sample_rate_hz,
+                   double alpha        = 0.15,
+                   double max_step_hz  = 0.3,
+                   double max_error_hz = 5.0)
+        {
+            m_enabled      = true;
+            m_est_hz       = initial_hz;
+            m_fs           = sample_rate_hz;
+            m_alpha        = alpha;
+            m_max_step_hz  = max_step_hz;
+            m_max_error_hz = max_error_hz;
+            m_sum_abs      = 0.0;
+            m_updates      = 0;
+        }
+
+        void disable()
+        {
+            m_enabled = false;
+        }
+
+        [[nodiscard]] bool enabled() const noexcept
+        {
+            return m_enabled;
+        }
+
+        [[nodiscard]] double currentHz() const noexcept
+        {
+            return m_est_hz;
+        }
+
+        [[nodiscard]] double averageStepHz() const noexcept
+        {
+            return m_updates > 0 ? m_sum_abs / static_cast<double>(m_updates) : 0.0;
+        }
+
+        void apply(std::complex<float> * data,
+                   int                  count) const
+        {
+            if (!m_enabled || !data || count <= 0 || m_fs <= 0.0) return;
+
+            double const dphi  = 2.0 * std::numbers::pi * (m_est_hz / m_fs);
+            auto   const wstep = std::polar(1.0f, static_cast<float>(dphi));
+            auto         w     = std::complex<float>{1.0f, 0.0f};
+
+            for (int i = 0; i < count; ++i)
+            {
+                w       *= wstep;
+                data[i] *= w;
+            }
+        }
+
+        void update(double residual_hz,
+                    double weight = 1.0)
+        {
+            if (!m_enabled || m_fs <= 0.0) return;
+            if (!std::isfinite(residual_hz) || !std::isfinite(weight) || weight <= 0.0) return;
+            if (std::abs(residual_hz) > m_max_error_hz) return;
+
+            residual_hz *= std::min(weight, 1.0);
+
+            double const step = std::clamp(residual_hz, -m_max_step_hz, m_max_step_hz);
+            m_est_hz += m_alpha * step;
+
+            m_sum_abs += std::abs(step);
+            ++m_updates;
+        }
+
+    private:
+
+        bool   m_enabled      = true;
+        double m_est_hz       = 0.0;
+        double m_fs           = 0.0;
+        double m_alpha        = 0.15;
+        double m_max_step_hz  = 0.3;
+        double m_max_error_hz = 5.0;
+        double m_sum_abs      = 0.0;
+        int    m_updates      = 0;
+    };
+
+    class TimingTracker
+    {
+    public:
+
+        void reset(double initial_samples,
+                   double alpha           = 0.15,
+                   double max_step        = 0.35,
+                   double max_total_error = 2.0)
+        {
+            m_enabled        = true;
+            m_est_samples    = initial_samples;
+            m_alpha          = alpha;
+            m_max_step       = max_step;
+            m_max_total      = max_total_error;
+            m_sum_abs        = 0.0;
+            m_updates        = 0;
+        }
+
+        void disable()
+        {
+            m_enabled = false;
+        }
+
+        [[nodiscard]] bool enabled() const noexcept
+        {
+            return m_enabled;
+        }
+
+        [[nodiscard]] double currentSamples() const noexcept
+        {
+            return m_est_samples;
+        }
+
+        [[nodiscard]] double averageStepSamples() const noexcept
+        {
+            return m_updates > 0 ? m_sum_abs / static_cast<double>(m_updates) : 0.0;
+        }
+
+        void update(double residual_samples,
+                    double weight = 1.0)
+        {
+            if (!m_enabled) return;
+            if (!std::isfinite(residual_samples) || !std::isfinite(weight) || weight <= 0.0) return;
+
+            residual_samples *= std::min(weight, 1.0);
+
+            double const step = std::clamp(residual_samples, -m_max_step, m_max_step);
+            double const next = m_est_samples + m_alpha * step;
+
+            if (std::abs(next) > m_max_total) return;
+
+            m_est_samples = next;
+            m_sum_abs    += std::abs(step);
+            ++m_updates;
+        }
+
+    private:
+
+        bool   m_enabled     = true;
+        double m_est_samples = 0.0;
+        double m_alpha       = 0.15;
+        double m_max_step    = 0.35;
+        double m_max_total   = 2.0;
+        double m_sum_abs     = 0.0;
+        int    m_updates     = 0;
+    };
 }
 
 /******************************************************************************/
@@ -1422,6 +1574,8 @@ namespace
         FFTWPlanManager                                                               plans;
         SyncIndex                                                                     sync;
         SoftCombiner                                                                  m_softCombiner;
+        bool                                                                          m_enableFreqTracking = true;
+        bool                                                                          m_enableTimingTracking = true;
 
         using Plan = FFTWPlanManager::Type;
 
@@ -1489,6 +1643,9 @@ namespace
             constexpr float FR  = 12000.0f / Mode::NFFT1;  // Frequency resolution
             constexpr float FS2 = 12000.0f / Mode::NDOWN;
             constexpr float DT2 = 1.0f     / FS2;
+
+            float const coarseStartHz = f1;
+            float const coarseStartDt = xdt;
 
             auto  const index        = static_cast<int>(std::round(f1 / FR)); // Closest index
             float const scaled_value = 0.1f * (savg[index] - Mode::BASESUB);  // Adjust and scale
@@ -1563,11 +1720,122 @@ namespace
 
             std::array<std::array<float, NN>, NROWS> s2;
 
+            FrequencyTracker freqTracker;
+            if (m_enableFreqTracking)
+            {
+                freqTracker.reset(0.0, FS2);
+            }
+            else
+            {
+                freqTracker.disable();
+            }
+
+            TimingTracker timingTracker;
+            if (m_enableTimingTracking)
+            {
+                timingTracker.reset(0.0);
+            }
+            else
+            {
+                timingTracker.disable();
+            }
+
+            auto const estimateResidualHz = [&](int expectedTone) -> std::optional<float>
+            {
+                if (!freqTracker.enabled()) return std::nullopt;
+
+                if (expectedTone < 0 || expectedTone + 1 >= Mode::NDOWNSPS) return std::nullopt;
+
+                float const m0    = std::norm(csymb[expectedTone]);
+                float const mplus = std::norm(csymb[expectedTone + 1]);
+                float const mminus= expectedTone > 0 ? std::norm(csymb[expectedTone - 1]) : 0.0f;
+
+                if (m0 <= 0.0f) return std::nullopt;
+
+                float const ratio = m0 / (mplus + mminus + 1e-12f);
+                if (ratio < 1.5f) return std::nullopt;
+
+                float const denom = mminus - 2.0f * m0 + mplus;
+                if (std::abs(denom) < 1e-9f) return std::nullopt;
+
+                float delta = 0.5f * (mminus - mplus) / denom;
+                delta       = std::clamp(delta, -0.5f, 0.5f);
+
+                return delta * (FS2 / Mode::NDOWNSPS);
+            };
+
+            auto const logTracker = [&](char const * tag)
+            {
+                if (decoder_js8().isDebugEnabled())
+                {
+                    if (freqTracker.enabled())
+                    {
+                        qCDebug(decoder_js8) << "freqTracker"
+                                             << tag
+                                             << "coarseHz"   << coarseStartHz
+                                             << "fineHz"     << f1
+                                             << "refinedHz"  << f1 + static_cast<float>(freqTracker.currentHz())
+                                             << "avgStepHz"  << static_cast<float>(freqTracker.averageStepHz());
+                    }
+
+                    if (timingTracker.enabled())
+                    {
+                        qCDebug(decoder_js8) << "timingTracker"
+                                             << tag
+                                             << "coarseDt"   << coarseStartDt
+                                             << "fineDt"     << xdt
+                                             << "refinedDt"  << xdt + static_cast<float>(timingTracker.currentSamples() * DT2)
+                                             << "avgStepSmpl"<< static_cast<float>(timingTracker.averageStepSamples());
+                    }
+                }
+            };
+
+            auto const goertzelEnergy = [&](int start,
+                                            int expectedTone) -> std::optional<float>
+            {
+                if (start < 0 || start + Mode::NDOWNSPS > NP2) return std::nullopt;
+
+                std::array<std::complex<float>, Mode::NDOWNSPS> tmp;
+                std::copy(cd0.begin() + start,
+                          cd0.begin() + start + Mode::NDOWNSPS,
+                          tmp.begin());
+
+                if (freqTracker.enabled())
+                {
+                    freqTracker.apply(tmp.data(), Mode::NDOWNSPS);
+                }
+
+                auto const wstep = std::polar(1.0f, static_cast<float>(-TAU * expectedTone / Mode::NDOWNSPS));
+                auto       phase = std::complex<float>{1.0f, 0.0f};
+                std::complex<float> acc{0.0f, 0.0f};
+
+                for (auto const & sample : tmp)
+                {
+                    acc   += sample * std::conj(phase);
+                    phase *= wstep;
+                }
+
+                return std::norm(acc);
+            };
+
             for (int k = 0; k < NN; ++k)
             {
                 // Calculate the starting index for the current symbol.
 
-                int const i1 = ibest + k * Mode::NDOWNSPS;
+                int const i1Base = ibest + k * Mode::NDOWNSPS;
+                int const timingShift = timingTracker.enabled()
+                    ? static_cast<int>(std::round(timingTracker.currentSamples()))
+                    : 0;
+                int       i1 = i1Base + timingShift;
+
+                if (i1 < 0)
+                {
+                    i1 = 0;
+                }
+                else if (i1 + Mode::NDOWNSPS > NP2)
+                {
+                    i1 = NP2 - Mode::NDOWNSPS;
+                }
 
                 csymb.fill(ZERO);
 
@@ -1576,6 +1844,11 @@ namespace
                     std::copy(cd0.begin() + i1,
                               cd0.begin() + i1 + Mode::NDOWNSPS,
                               csymb.begin());
+
+                    if (freqTracker.enabled())
+                    {
+                        freqTracker.apply(csymb.data(), Mode::NDOWNSPS);
+                    }
                 }
 
                 fftwf_execute(plans[Plan::CS]);
@@ -1585,6 +1858,58 @@ namespace
                 for (int i = 0; i < NROWS; ++i)
                 {
                     s2[i][k] = std::abs(csymb[i]) / 1000.0f;
+                }
+
+                if (freqTracker.enabled() || timingTracker.enabled())
+                {
+                    bool const isPilot = (k < 7) ||
+                                         (k >= 36 && k < 43) ||
+                                         (k >= 72 && k < 79);
+
+                    if (isPilot)
+                    {
+                        int   costasBlock   = 0;
+                        int   costasColumn  = k;
+
+                        if (k >= 36 && k < 43)
+                        {
+                            costasBlock  = 1;
+                            costasColumn = k - 36;
+                        }
+                        else if (k >= 72 && k < 79)
+                        {
+                            costasBlock  = 2;
+                            costasColumn = k - 72;
+                        }
+
+                        int const expectedTone = Costas[costasBlock][costasColumn];
+
+                        if (auto const residual = estimateResidualHz(expectedTone))
+                        {
+                            freqTracker.update(*residual);
+                        }
+
+                        if (timingTracker.enabled())
+                        {
+                            auto const e0     = goertzelEnergy(i1, expectedTone);
+                            auto const eEarly = goertzelEnergy(i1 - 1, expectedTone);
+                            auto const eLate  = goertzelEnergy(i1 + 1, expectedTone);
+
+                            float const toneMag = s2[expectedTone][k];
+
+                            if (e0 && eEarly && eLate && toneMag > 1e-6f)
+                            {
+                                float const denom = *e0 + 1e-6f;
+                                float const grad  = (*eLate - *eEarly) / denom;
+
+                                // Smaller steps; favor stability.
+                                double const weight = std::clamp(static_cast<double>(toneMag / 5.0f), 0.0, 1.0);
+                                double const errorSamples = std::clamp(0.25 * static_cast<double>(grad), -1.0, 1.0);
+
+                                timingTracker.update(errorSamples, weight);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1620,7 +1945,11 @@ namespace
 
             // If the sync quality isn't at least 7, this one's a loser.
 
-            if (nsync <= 6) return std::nullopt;
+            if (nsync <= 6)
+            {
+                logTracker("sync_fail");
+                return std::nullopt;
+            }
 
             if (syncStats) emitEvent(JS8::Event::SyncState{JS8::Event::SyncState::Type::CANDIDATE,
                                                            Mode::NSUBMODE,
@@ -1957,6 +2286,7 @@ namespace
 
                         m_softCombiner.markDecoded(combined.key);
 
+                        logTracker("decoded");
                         return std::make_optional<Decode>(i3bit, message);
                    }
                 }
@@ -1966,6 +2296,7 @@ namespace
                 }
             }
 
+            logTracker("fail");
             return std::nullopt;
         }
 
@@ -2595,6 +2926,9 @@ namespace
 
         DecodeMode()
         {
+            m_enableFreqTracking = std::getenv("JS8_DISABLE_FREQ_TRACKING") == nullptr;
+            m_enableTimingTracking = std::getenv("JS8_DISABLE_TIMING_TRACKING") == nullptr;
+
             // Intialize the Nuttal window. In theory, we can do this as a
             // constexpr function at compile time, but doing so yield results
             // slightly different than the Fortran version did, so for sanity
