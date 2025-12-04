@@ -16,6 +16,7 @@
 #include <mutex>
 #include <numbers>
 #include <numeric>
+#include <chrono>
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
@@ -30,7 +31,11 @@
 #include <fftw3.h>
 #include <vendor/Eigen/Dense>
 #include <QDebug>
+#include <QLoggingCategory>
+#include <QtGlobal>
 #include "commons.h"
+
+Q_DECLARE_LOGGING_CATEGORY(decoder_js8);
 
 // A C++ conversion of the Fortran JS8 encoding and decoder function.
 // Some notes on the conversion:
@@ -82,8 +87,8 @@ namespace
     // is the better choice at runtime. Once we move to requiring a
     // C++20 compiler, we can just use std::cos.
 
-    constexpr auto
-    cos(double x)
+    constexpr double
+    cos_approx(double x)
     {
         constexpr auto RAD_360 = std::numbers::pi * 2;
         constexpr auto RAD_180 = std::numbers::pi;
@@ -94,7 +99,7 @@ namespace
         // itself is only 1-e16, so within the domain of doubles,
         // this should be extremely accurate.
 
-        constexpr auto cos = [](double const x)
+        constexpr auto poly = [](double const x)
         {
             constexpr std::array coefficients =
             {
@@ -140,7 +145,7 @@ namespace
         // Map x to [0, RAD_90] and evaluate the polynomial;
         // flip the sign for angles in the second quadrant.
 
-        return x > RAD_90 ? -cos(RAD_180 - x) : cos(x);
+        return x > RAD_90 ? -poly(RAD_180 - x) : poly(x);
     };
 }
 
@@ -190,6 +195,331 @@ namespace
     constexpr float       TAU      = 2.0f * std::numbers::pi_v<float>;
     constexpr auto        ZERO     = std::complex<float>{0.0f, 0.0f};
 
+    /**************************************************************************/
+    // Soft-combining support
+    /**************************************************************************/
+
+    // Fixed sample of bit positions used to generate a repeatable signature
+    // from the sign of the LLRs; spread across the full 174-bit vector.
+    constexpr std::array<int, 32> SIGNATURE_INDICES = []()
+    {
+        std::array<int, 32> indices{};
+        int value = 0;
+        for (std::size_t i = 0; i < indices.size(); ++i)
+        {
+            // Use a stride that walks the 174-bit space without clustering.
+            value = (value + 37) % N;
+            indices[i] = value;
+        }
+        return indices;
+    }();
+
+    // Cache and accumulate normalized LLRs for repeated receptions of what
+    // appears to be the same frame (coarse freq / dt plus a light-weight
+    // signature). Summed LLRs are returned to the decoder to improve decode
+    // probability without changing on-air behavior.
+    class SoftCombiner
+    {
+        using Clock = std::chrono::steady_clock;
+
+    public:
+        struct Key
+        {
+            int      mode;
+            int      freqBin;
+            int      dtBin;
+            uint32_t signature;
+
+            bool operator==(Key const & other) const noexcept
+            {
+                return mode      == other.mode     &&
+                       freqBin   == other.freqBin  &&
+                       dtBin     == other.dtBin    &&
+                       signature == other.signature;
+            }
+        };
+
+        struct Combined
+        {
+            Key                                    key;
+            std::array<float, N>                   llr0;
+            std::array<float, N>                   llr1;
+            int                                    repeats;
+            bool                                   combined;
+        };
+
+        SoftCombiner()
+        : SoftCombiner(defaultEnabled(), true)
+        {}
+
+        explicit SoftCombiner(bool enabled, bool runSelfTest = true)
+        : m_enabled(enabled)
+        {
+            if (!m_enabled)
+            {
+                qCDebug(decoder_js8) << "soft-combining disabled (JS8_SOFT_COMBINING=0)";
+            }
+            if (runSelfTest) maybeRunSelfTest();
+        }
+
+        Key makeKey(int                    mode,
+                    float                  f1,
+                    float                  dt,
+                    std::array<float, N> const & llr0,
+                    std::array<float, N> const & llr1) const
+        {
+            return Key
+            {
+                mode,
+                static_cast<int>(std::lround(f1)),
+                static_cast<int>(std::lround(dt * 10.0f)), // 100 ms bins
+                signature(llr0, llr1)
+            };
+        }
+
+        Combined combine(Key                         const & key,
+                         std::array<float, N>        const & llr0,
+                         std::array<float, N>        const & llr1,
+                         std::chrono::seconds               ttl)
+        {
+            flush(ttl);
+
+            if (!m_enabled)
+            {
+                return Combined{key, llr0, llr1, 1, false};
+            }
+
+            auto & bucket = m_entries[keyForLookup(key)];
+            auto   it     = findEntry(bucket, key.signature);
+
+            if (it == bucket.end())
+            {
+                bucket.push_back(makeEntry(key.signature, llr0, llr1));
+                return Combined{key, llr0, llr1, 1, false};
+            }
+
+            for (std::size_t i = 0; i < llr0.size(); ++i)
+            {
+                it->llr0[i] += llr0[i];
+                it->llr1[i] += llr1[i];
+            }
+
+            ++it->repeats;
+            it->lastSeen = Clock::now();
+
+            qCDebug(decoder_js8)
+                << "soft-combining repeats" << it->repeats
+                << "mode"  << key.mode
+                << "freq"  << key.freqBin
+                << "dtbin" << key.dtBin;
+
+            return Combined{key, it->llr0, it->llr1, it->repeats, true};
+        }
+
+        void markDecoded(Key const & key)
+        {
+            if (!m_enabled) return;
+
+            auto lookup = keyForLookup(key);
+            auto it     = m_entries.find(lookup);
+
+            if (it == m_entries.end()) return;
+
+            auto & bucket = it->second;
+            bucket.erase(std::remove_if(bucket.begin(),
+                                        bucket.end(),
+                                        [&key](Entry const & entry)
+                                        {
+                                            return entry.signature == key.signature;
+                                        }),
+                         bucket.end());
+
+            if (bucket.empty()) m_entries.erase(it);
+        }
+
+        void flush(std::chrono::seconds ttl)
+        {
+            if (!m_enabled) return;
+
+            auto const now = Clock::now();
+
+            for (auto it = m_entries.begin(); it != m_entries.end();)
+            {
+                auto & bucket = it->second;
+
+                bucket.erase(std::remove_if(bucket.begin(),
+                                            bucket.end(),
+                                            [now, ttl](Entry const & entry)
+                                            {
+                                                return now - entry.lastSeen > ttl;
+                                            }),
+                             bucket.end());
+
+                if (bucket.empty()) it = m_entries.erase(it);
+                else                ++it;
+            }
+        }
+
+    private:
+        struct CoarseKey
+        {
+            int mode;
+            int freqBin;
+            int dtBin;
+
+            bool operator==(CoarseKey const & other) const noexcept
+            {
+                return mode    == other.mode   &&
+                       freqBin == other.freqBin &&
+                       dtBin   == other.dtBin;
+            }
+        };
+
+        struct CoarseHash
+        {
+            std::size_t operator()(CoarseKey const & key) const noexcept
+            {
+                std::size_t const h1 = std::hash<int>{}(key.mode);
+                std::size_t const h2 = std::hash<int>{}(key.freqBin);
+                std::size_t const h3 = std::hash<int>{}(key.dtBin);
+                return h1 ^ (h2 << 1) ^ (h3 << 2);
+            }
+        };
+
+        struct Entry
+        {
+            uint32_t                     signature;
+            std::array<float, N>         llr0;
+            std::array<float, N>         llr1;
+            int                          repeats;
+            Clock::time_point            lastSeen;
+        };
+
+        using Bucket = std::vector<Entry>;
+
+        static bool defaultEnabled()
+        {
+            bool ok = false;
+            int  value = qEnvironmentVariableIntValue("JS8_SOFT_COMBINING", &ok);
+            return ok ? value != 0 : true;
+        }
+
+        static uint32_t signature(std::array<float, N> const & llr0,
+                                  std::array<float, N> const & llr1)
+        {
+            uint32_t sig = 0;
+            for (std::size_t i = 0; i < SIGNATURE_INDICES.size(); ++i)
+            {
+                auto const idx = SIGNATURE_INDICES[i];
+                float const v  = 0.5f * (llr0[idx] + llr1[idx]);
+                if (v >= 0.0f) sig |= (1u << i);
+            }
+            return sig;
+        }
+
+        static int hamming(uint32_t a, uint32_t b)
+        {
+            uint32_t v = a ^ b;
+            int      c = 0;
+            while (v)
+            {
+                v &= (v - 1);
+                ++c;
+            }
+            return c;
+        }
+
+        static void maybeRunSelfTest()
+        {
+            static std::once_flag once;
+            std::call_once(once, []()
+            {
+                if (!qEnvironmentVariableIsSet("JS8_SOFT_COMBINING_TEST")) return;
+
+                SoftCombiner combiner(true, false);
+
+                std::array<float, N> baseline{};
+                for (std::size_t i = 0; i < baseline.size(); ++i)
+                {
+                    baseline[i] = (i % 2 == 0) ? 2.0f : -2.0f;
+                }
+
+                auto noisy = [](std::array<float, N> base, int flipStride)
+                {
+                    for (std::size_t i = 0; i < base.size(); ++i)
+                    {
+                        if (i % flipStride == 0)
+                        {
+                            base[i] *= -0.4f; // flip sign and reduce magnitude
+                        }
+                        else
+                        {
+                            base[i] *= 0.8f; // weaken but keep sign
+                        }
+                    }
+                    return base;
+                };
+
+                auto llrA = noisy(baseline, 7);
+                auto llrB = noisy(baseline, 11);
+
+                auto key = combiner.makeKey(0, 1500.0f, 1.0f, llrA, llrB);
+                auto first  = combiner.combine(key, llrA, llrA, std::chrono::seconds{30});
+                auto second = combiner.combine(key, llrB, llrB, std::chrono::seconds{30});
+
+                auto countMatches = [](std::array<float, N> const & llr,
+                                       std::array<float, N> const & reference)
+                {
+                    int matches = 0;
+                    for (std::size_t i = 0; i < llr.size(); ++i)
+                    {
+                        if (llr[i] * reference[i] > 0) ++matches;
+                    }
+                    return matches;
+                };
+
+                int const matchesA        = countMatches(first.llr0,  baseline);
+                int const matchesB        = countMatches(llrB,        baseline);
+                int const matchesCombined = countMatches(second.llr0, baseline);
+
+                qCDebug(decoder_js8)
+                    << "soft-combining self-test: A matches" << matchesA
+                    << "B matches" << matchesB
+                    << "combined matches" << matchesCombined
+                    << "repeats" << second.repeats;
+            });
+        }
+
+        static Entry makeEntry(uint32_t              signature,
+                               std::array<float, N> const & llr0,
+                               std::array<float, N> const & llr1)
+        {
+            return Entry{signature, llr0, llr1, 1, Clock::now()};
+        }
+
+        CoarseKey keyForLookup(Key const & key) const
+        {
+            return CoarseKey{key.mode, key.freqBin, key.dtBin};
+        }
+
+        Bucket::iterator findEntry(Bucket            & bucket,
+                                   uint32_t            signature)
+        {
+            constexpr int MAX_HAMMING = 4; // allow small differences between noisy repeats
+
+            return std::find_if(bucket.begin(),
+                                bucket.end(),
+                                [signature](Entry const & entry)
+                                {
+                                    return hamming(signature, entry.signature) <= MAX_HAMMING;
+                                });
+        }
+
+        std::unordered_map<CoarseKey, Bucket, CoarseHash> m_entries;
+        bool                                               m_enabled;
+    };
+ 
+    // Key for the constants that follow:
     // Key for the constants that follow:
     //
     //   NSUBMODE - ID of the submode
@@ -412,7 +742,7 @@ namespace
 
         for (std::size_t i = 0; i < nodes.size(); ++i)
         {
-            nodes[i] = 0.5 * (1.0 - cos(slice * (2.0 * i + 1)));
+            nodes[i] = 0.5 * (1.0 - cos_approx(slice * (2.0 * i + 1)));
         }
 
         return nodes;
@@ -1088,6 +1418,7 @@ namespace
         std::array<float, Mode::NSPS>                                                 savg;
         FFTWPlanManager                                                               plans;
         SyncIndex                                                                     sync;
+        SoftCombiner                                                                  m_softCombiner;
 
         using Plan = FFTWPlanManager::Type;
 
@@ -1102,7 +1433,7 @@ namespace
 
             for (size_t i = 0; i <= Mode::NDD; ++i)
             {
-                float const value = 0.5f * (1.0f + cos(i * std::numbers::pi_v<float> / Mode::NDD));
+                float const value = 0.5f * (1.0f + cos_approx(i * std::numbers::pi_v<float> / Mode::NDD));
 
                 taper[1][            i] = value; // TailTaper (original taper)
                 taper[0][Mode::NDD - i] = value; // HeadTaper (reversed taper)
@@ -1358,6 +1689,16 @@ namespace
             normalizeLLR(llr0);
             normalizeLLR(llr1);
 
+            auto const ttl = std::chrono::seconds{Mode::NTXDUR * 2};
+
+            m_softCombiner.flush(ttl);
+
+            auto const key      = m_softCombiner.makeKey(Mode::NSUBMODE, f1, xdt, llr0, llr1);
+            auto       combined = m_softCombiner.combine(key, llr0, llr1, ttl);
+
+            auto llr0Combined = combined.llr0;
+            auto llr1Combined = combined.llr1;
+
             std::array<int8_t, K> decoded;
             std::array<int8_t, N> cw;
 
@@ -1366,13 +1707,13 @@ namespace
             {
                 // LLR 0 used on passes 1, 3, and 4; LLR 1 used on pass 2.
 
-                auto const & llr = ipass == 2 ? llr1 : llr0;
+                auto & llr = ipass == 2 ? llr1Combined : llr0Combined;
 
                 // Zero the first 24 bytes of LLR 0 on the third pass;
                 // the first 48 bytes of LLR 0 on the fourth pass;
 
-                if      (ipass == 3) std::fill(llr0.begin(),      llr0.begin() + 24, 0.0f);
-                else if (ipass == 4) std::fill(llr0.begin() + 24, llr0.begin() + 48, 0.0f);
+                if      (ipass == 3) std::fill(llr0Combined.begin(),      llr0Combined.begin() + 24, 0.0f);
+                else if (ipass == 4) std::fill(llr0Combined.begin() + 24, llr0Combined.begin() + 48, 0.0f);
 
                 // Decode using belief propagation.
 
@@ -1430,6 +1771,8 @@ namespace
                                 xsig / xbase -  1.0f,
                                 1.259e-10f)) - 32.0f,
                            -60.0f);  // XXX was -28.0f in Fortran
+
+                        m_softCombiner.markDecoded(combined.key);
 
                         return std::make_optional<Decode>(i3bit, message);
                    }
@@ -2293,6 +2636,8 @@ namespace
             }
 
             Decode::Map decodes;
+            auto const ttl = std::chrono::seconds{Mode::NTXDUR * 2};
+            m_softCombiner.flush(ttl);
 
             for (int ipass = 1; ipass <= 3; ++ipass)
             {
