@@ -203,7 +203,8 @@ namespace
     constexpr float       LLR_FEEDBACK_CONFIDENT_BOOST = 1.2f;
     constexpr float       LLR_FEEDBACK_UNCERTAIN_SHRINK= 0.5f;
     constexpr float       LLR_FEEDBACK_MAX_MAG         = 6.0f;
-    constexpr int         LDPC_FEEDBACK_MAX_PASSES_DEFAULT = 3;
+    // Allow all four legacy LDPC passes plus feedback retries by default.
+    constexpr int         LDPC_FEEDBACK_MAX_PASSES_DEFAULT = 8;
 
     /**************************************************************************/
     // Soft-combining support
@@ -1830,10 +1831,16 @@ namespace
                 freqTracker.disable();
             }
 
+            // Scale timing clamp relative to samples per symbol so short-symbol
+            // modes aren't allowed outsized shifts (e.g., 12-sample turbo).
+            double const timingMaxShift = std::clamp(0.08 * static_cast<double>(Mode::NDOWNSPS),
+                                                     0.5,
+                                                     2.0);
+
             TimingTracker timingTracker;
             if (m_enableTimingTracking)
             {
-                timingTracker.reset(0.0);
+                timingTracker.reset(0.0, 0.15, 0.35, timingMaxShift);
             }
             else
             {
@@ -2203,6 +2210,7 @@ namespace
 
             bool  const disableWhitening   = std::getenv("JS8_DISABLE_WHITENING") != nullptr;
             bool  const whiteningAvailable = toneNoise && symbolNoise && !symbolNoise->empty() && !disableWhitening;
+            bool  const applyErasureInWhitening = whiteningAvailable && m_llrErasureThreshold > 0.0f;
             double       sumAbsPre  = 0.0;
             double       sumAbsPost = 0.0;
             std::size_t  erasures   = 0;
@@ -2238,6 +2246,8 @@ namespace
                     float const sn        = std::max(0.0f, (*symbolNoise)[j]);
                     float const localNoise = std::sqrt(tn * sn + 1e-12f);
 
+                    float const erasureThreshold = m_llrErasureThreshold;
+
                     auto const applyWhitening = [&](float & value)
                     {
                         float const pre = std::abs(value);
@@ -2248,7 +2258,7 @@ namespace
                             value /= localNoise;
                         }
 
-                        if (std::abs(value) < LLR_ERASURE_THRESHOLD_DEFAULT)
+                        if (erasureThreshold > 0.0f && std::abs(value) < erasureThreshold)
                         {
                             value = 0.0f;
                             ++erasures;
@@ -2301,46 +2311,51 @@ namespace
                                      << "erasures:" << erasures;
             }
 
-            std::size_t erasuresAfterThreshold = 0;
-            double      sumAbsPreErasure       = 0.0;
-            double      sumAbsPostErasure      = 0.0;
-
-            auto const applyErasureThreshold = [&](auto & llr)
+            // Only apply a second erasure threshold pass if whitening didn't already
+            // zero low-magnitude LLRs using the configured threshold.
+            if (!applyErasureInWhitening)
             {
-                for (auto const value : llr) sumAbsPreErasure += std::abs(value);
+                std::size_t erasuresAfterThreshold = 0;
+                double      sumAbsPreErasure       = 0.0;
+                double      sumAbsPostErasure      = 0.0;
 
-                if (m_llrErasureThreshold > 0.0f)
+                auto const applyErasureThreshold = [&](auto & llr)
                 {
-                    for (auto & value : llr)
+                    for (auto const value : llr) sumAbsPreErasure += std::abs(value);
+
+                    if (m_llrErasureThreshold > 0.0f)
                     {
-                        if (std::abs(value) < m_llrErasureThreshold)
+                        for (auto & value : llr)
                         {
-                            value = 0.0f;
-                            ++erasuresAfterThreshold;
+                            if (std::abs(value) < m_llrErasureThreshold)
+                            {
+                                value = 0.0f;
+                                ++erasuresAfterThreshold;
+                            }
+
+                            sumAbsPostErasure += std::abs(value);
                         }
-
-                        sumAbsPostErasure += std::abs(value);
                     }
-                }
-                else
+                    else
+                    {
+                        for (auto const value : llr) sumAbsPostErasure += std::abs(value);
+                    }
+                };
+
+                applyErasureThreshold(llr0);
+                applyErasureThreshold(llr1);
+
+                if (decoder_js8().isDebugEnabled())
                 {
-                    for (auto const value : llr) sumAbsPostErasure += std::abs(value);
+                    auto const total = static_cast<double>(llr0.size() + llr1.size());
+                    double const avgPre  = total > 0.0 ? sumAbsPreErasure  / total : 0.0;
+                    double const avgPost = total > 0.0 ? sumAbsPostErasure / total : 0.0;
+
+                    qCDebug(decoder_js8) << "LLR erasure threshold"
+                                         << m_llrErasureThreshold
+                                         << "erasures:" << erasuresAfterThreshold
+                                         << "avg|LLR| pre/post:" << avgPre << avgPost;
                 }
-            };
-
-            applyErasureThreshold(llr0);
-            applyErasureThreshold(llr1);
-
-            if (decoder_js8().isDebugEnabled())
-            {
-                auto const total = static_cast<double>(llr0.size() + llr1.size());
-                double const avgPre  = total > 0.0 ? sumAbsPreErasure  / total : 0.0;
-                double const avgPost = total > 0.0 ? sumAbsPostErasure / total : 0.0;
-
-                qCDebug(decoder_js8) << "LLR erasure threshold"
-                                     << m_llrErasureThreshold
-                                     << "erasures:" << erasuresAfterThreshold
-                                     << "avg|LLR| pre/post:" << avgPre << avgPost;
             }
 
             auto const ttl = std::chrono::seconds{Mode::NTXDUR * 2};
