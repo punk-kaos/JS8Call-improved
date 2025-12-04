@@ -10,12 +10,14 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <numbers>
 #include <numeric>
+#include <sstream>
 #include <chrono>
 #include <stdexcept>
 #include <string_view>
@@ -194,6 +196,7 @@ namespace
     constexpr int         NP2      = 2812;
     constexpr float       TAU      = 2.0f * std::numbers::pi_v<float>;
     constexpr auto        ZERO     = std::complex<float>{0.0f, 0.0f};
+    constexpr float       LLR_ERASURE_THRESHOLD = 0.25f;  // Adjustable if needed.
 
     /**************************************************************************/
     // Soft-combining support
@@ -1635,10 +1638,145 @@ namespace
                 std::copy(s2[row].begin() + 43, s2[row].begin() + 72, s1[row].begin() + 29);
             }
 
+            // Identify winning tones (max magnitude) for each data symbol.
+            std::array<int, ND> symbolWinners = {};
+
+            for (int j = 0; j < ND; ++j)
+            {
+                int   winner = 0;
+                float best   = s1[0][j];
+
+                for (int i = 1; i < NROWS; ++i)
+                {
+                    if (s1[i][j] > best)
+                    {
+                        best   = s1[i][j];
+                        winner = i;
+                    }
+                }
+
+                symbolWinners[j] = winner;
+            }
+
+            // Median helper reused for tone and symbol noise estimates.
+            auto const median = [](std::vector<float> & values) -> std::optional<float>
+            {
+                if (values.empty()) return std::nullopt;
+
+                auto const mid = values.size() / 2;
+
+                std::nth_element(values.begin(), values.begin() + mid, values.end());
+                float med = values[mid];
+
+                if ((values.size() % 2) == 0 && mid > 0)
+                {
+                    std::nth_element(values.begin(), values.begin() + (mid - 1), values.end());
+                    med = 0.5f * (med + values[mid - 1]);
+                }
+
+                return med;
+            };
+
+            // Estimate per-tone noise using non-winning tone magnitudes across the frame.
+            auto const toneNoise = [&]() -> std::optional<std::array<float, NROWS>>
+            {
+                std::array<std::vector<float>, NROWS> toneSamples;
+                std::array<float, NROWS>              noise = {};
+
+                // Collect non-winning magnitudes for each tone.
+                for (int j = 0; j < ND; ++j)
+                {
+                    int const winner = symbolWinners[j];
+
+                    for (int i = 0; i < NROWS; ++i)
+                    {
+                        if (i != winner) toneSamples[i].push_back(s1[i][j]);
+                    }
+                }
+
+                bool ok = true;
+
+                for (int i = 0; i < NROWS; ++i)
+                {
+                    if (auto m = median(toneSamples[i]); m)
+                    {
+                        noise[i] = *m;
+                    }
+                    else
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+
+                if (!ok) return std::nullopt;
+
+                return noise;
+            }();
+
+            if (toneNoise && decoder_js8().isDebugEnabled())
+            {
+                std::ostringstream oss;
+
+                oss << "toneNoise:";
+                for (auto const value : *toneNoise) oss << ' ' << value;
+
+                qCDebug(decoder_js8).noquote() << oss.str().c_str();
+            }
+
+            // Estimate per-symbol noise using non-winning tone magnitudes per symbol.
+            auto const symbolNoise = [&]() -> std::optional<std::vector<float>>
+            {
+                std::vector<float> noise;
+                noise.reserve(ND);
+
+                for (int j = 0; j < ND; ++j)
+                {
+                    std::vector<float> bins;
+                    bins.reserve(NROWS - 1);
+
+                    int const winner = symbolWinners[j];
+
+                    for (int i = 0; i < NROWS; ++i)
+                    {
+                        if (i != winner) bins.push_back(s1[i][j]);
+                    }
+
+                    if (auto m = median(bins); m)
+                    {
+                        noise.push_back(*m);
+                    }
+                    else
+                    {
+                        return std::nullopt;
+                    }
+                }
+
+                return noise;
+            }();
+
+            if (symbolNoise && !symbolNoise->empty() && decoder_js8().isDebugEnabled())
+            {
+                auto const [minIt, maxIt] = std::minmax_element(symbolNoise->begin(), symbolNoise->end());
+                float const avg = std::accumulate(symbolNoise->begin(), symbolNoise->end(), 0.0f) /
+                                  static_cast<float>(symbolNoise->size());
+
+                qCDebug(decoder_js8) << "symbolNoise avg/min/max"
+                                     << avg
+                                     << *minIt
+                                     << *maxIt;
+            }
+
             // Temporary variables for metrics
 
             std::array<float, 3 * ND> llr0 = {};
             std::array<float, 3 * ND> llr1 = {};
+
+            bool  const disableWhitening   = std::getenv("JS8_DISABLE_WHITENING") != nullptr;
+            bool  const whiteningAvailable = toneNoise && symbolNoise && !symbolNoise->empty() && !disableWhitening;
+            double       sumAbsPre  = 0.0;
+            double       sumAbsPost = 0.0;
+            std::size_t  erasures   = 0;
 
             // Compute metrics for each row in `s1`
 
@@ -1663,6 +1801,40 @@ namespace
                 llr1[i1] = std::max({ps[4], ps[5], ps[6], ps[7]}) - std::max({ps[0], ps[1], ps[2], ps[3]}); // r4
                 llr1[i2] = std::max({ps[2], ps[3], ps[6], ps[7]}) - std::max({ps[0], ps[1], ps[4], ps[5]}); // r2
                 llr1[i4] = std::max({ps[1], ps[3], ps[5], ps[7]}) - std::max({ps[0], ps[2], ps[4], ps[6]}); // r1
+
+                if (whiteningAvailable)
+                {
+                    int const   winner    = symbolWinners[j];
+                    float const tn        = std::max(0.0f, (*toneNoise)[winner]);
+                    float const sn        = std::max(0.0f, (*symbolNoise)[j]);
+                    float const localNoise = std::sqrt(tn * sn + 1e-12f);
+
+                    auto const applyWhitening = [&](float & value)
+                    {
+                        float const pre = std::abs(value);
+                        sumAbsPre += pre;
+
+                        if (localNoise > 0.0f && std::isfinite(localNoise))
+                        {
+                            value /= localNoise;
+                        }
+
+                        if (std::abs(value) < LLR_ERASURE_THRESHOLD)
+                        {
+                            value = 0.0f;
+                            ++erasures;
+                        }
+
+                        sumAbsPost += std::abs(value);
+                    };
+
+                    applyWhitening(llr0[i1]);
+                    applyWhitening(llr0[i2]);
+                    applyWhitening(llr0[i4]);
+                    applyWhitening(llr1[i1]);
+                    applyWhitening(llr1[i2]);
+                    applyWhitening(llr1[i4]);
+                }
             }
 
             auto const normalizeLLR = [](auto & llr)
@@ -1688,6 +1860,17 @@ namespace
 
             normalizeLLR(llr0);
             normalizeLLR(llr1);
+
+            if (whiteningAvailable && decoder_js8().isDebugEnabled())
+            {
+                auto const total = static_cast<double>(llr0.size() + llr1.size());
+                double const avgPre  = total > 0.0 ? sumAbsPre  / total : 0.0;
+                double const avgPost = total > 0.0 ? sumAbsPost / total : 0.0;
+
+                qCDebug(decoder_js8) << "LLR whitening applied"
+                                     << "avg|LLR| pre/post:" << avgPre << avgPost
+                                     << "erasures:" << erasures;
+            }
 
             auto const ttl = std::chrono::seconds{Mode::NTXDUR * 2};
 
