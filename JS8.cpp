@@ -197,7 +197,13 @@ namespace
     constexpr int         NP2      = 2812;
     constexpr float       TAU      = 2.0f * std::numbers::pi_v<float>;
     constexpr auto        ZERO     = std::complex<float>{0.0f, 0.0f};
-    constexpr float       LLR_ERASURE_THRESHOLD = 0.25f;  // Adjustable if needed.
+    constexpr float       LLR_ERASURE_THRESHOLD_DEFAULT = 0.25f;  // Adjustable if needed.
+    constexpr float       LLR_FEEDBACK_CONFIDENT_MIN   = 3.0f;
+    constexpr float       LLR_FEEDBACK_UNCERTAIN_MAX   = 1.0f;
+    constexpr float       LLR_FEEDBACK_CONFIDENT_BOOST = 1.2f;
+    constexpr float       LLR_FEEDBACK_UNCERTAIN_SHRINK= 0.5f;
+    constexpr float       LLR_FEEDBACK_MAX_MAG         = 6.0f;
+    constexpr int         LDPC_FEEDBACK_MAX_PASSES_DEFAULT = 3;
 
     /**************************************************************************/
     // Soft-combining support
@@ -522,7 +528,98 @@ namespace
         std::unordered_map<CoarseKey, Bucket, CoarseHash> m_entries;
         bool                                               m_enabled;
     };
- 
+
+    float llrErasureThreshold()
+    {
+        float threshold = LLR_ERASURE_THRESHOLD_DEFAULT;
+
+        if (auto const env = std::getenv("JS8_LLR_ERASURE_THRESH"); env)
+        {
+            char * end = nullptr;
+            float  val = std::strtof(env, &end);
+
+            if (end != env && std::isfinite(val))
+            {
+                threshold = val;
+            }
+        }
+
+        if (threshold <= 0.0f || !std::isfinite(threshold) ||
+            std::getenv("JS8_DISABLE_ERASURE_THRESHOLDING"))
+        {
+            return 0.0f;
+        }
+
+        return threshold;
+    }
+
+    bool ldpcFeedbackEnabled()
+    {
+        bool ok = false;
+        int  value = qEnvironmentVariableIntValue("JS8_LDPC_FEEDBACK", &ok);
+        return ok ? value != 0 : true;
+    }
+
+    int ldpcFeedbackMaxPasses()
+    {
+        bool ok = false;
+        int  value = qEnvironmentVariableIntValue("JS8_LDPC_MAX_PASSES", &ok);
+
+        if (!ok) return LDPC_FEEDBACK_MAX_PASSES_DEFAULT;
+
+        return std::clamp(value, 1, LDPC_FEEDBACK_MAX_PASSES_DEFAULT);
+    }
+
+    void refineLlrsWithLdpcFeedback(std::array<float, N>  const & llrIn,
+                                    std::array<int8_t, N> const & cw,
+                                    float                       erasureThreshold,
+                                    std::array<float, N>        & llrOut,
+                                    int                         & confidentCount,
+                                    int                         & uncertainCount)
+    {
+        llrOut = llrIn;
+        confidentCount = 0;
+        uncertainCount = 0;
+
+        for (std::size_t i = 0; i < llrOut.size(); ++i)
+        {
+            float & value = llrOut[i];
+
+            if (!std::isfinite(value))
+            {
+                value = 0.0f;
+                ++uncertainCount;
+                continue;
+            }
+
+            bool  const bitOne    = cw[i] != 0;
+            float const mag       = std::abs(value);
+            bool  const signMatch = (value >= 0.0f) == bitOne;
+
+            if (signMatch && mag >= LLR_FEEDBACK_CONFIDENT_MIN)
+            {
+                ++confidentCount;
+                float boosted = mag * LLR_FEEDBACK_CONFIDENT_BOOST;
+                boosted = std::clamp(boosted, 0.0f, LLR_FEEDBACK_MAX_MAG);
+                value   = bitOne ? boosted : -boosted;
+            }
+            else if (!signMatch || mag <= LLR_FEEDBACK_UNCERTAIN_MAX)
+            {
+                ++uncertainCount;
+                float shrunk = mag * LLR_FEEDBACK_UNCERTAIN_SHRINK;
+
+                if (erasureThreshold > 0.0f && shrunk < erasureThreshold)
+                {
+                    value = 0.0f;
+                }
+                else
+                {
+                    value = bitOne ? shrunk : -shrunk;
+                }
+            }
+        }
+    }
+
     // Key for the constants that follow:
     // Key for the constants that follow:
     //
@@ -1576,6 +1673,9 @@ namespace
         SoftCombiner                                                                  m_softCombiner;
         bool                                                                          m_enableFreqTracking = true;
         bool                                                                          m_enableTimingTracking = true;
+        float                                                                         m_llrErasureThreshold = llrErasureThreshold();
+        bool                                                                          m_enableLdpcFeedback = ldpcFeedbackEnabled();
+        int                                                                           m_maxLdpcPasses     = ldpcFeedbackMaxPasses();
 
         using Plan = FFTWPlanManager::Type;
 
@@ -2148,7 +2248,7 @@ namespace
                             value /= localNoise;
                         }
 
-                        if (std::abs(value) < LLR_ERASURE_THRESHOLD)
+                        if (std::abs(value) < LLR_ERASURE_THRESHOLD_DEFAULT)
                         {
                             value = 0.0f;
                             ++erasures;
@@ -2201,6 +2301,48 @@ namespace
                                      << "erasures:" << erasures;
             }
 
+            std::size_t erasuresAfterThreshold = 0;
+            double      sumAbsPreErasure       = 0.0;
+            double      sumAbsPostErasure      = 0.0;
+
+            auto const applyErasureThreshold = [&](auto & llr)
+            {
+                for (auto const value : llr) sumAbsPreErasure += std::abs(value);
+
+                if (m_llrErasureThreshold > 0.0f)
+                {
+                    for (auto & value : llr)
+                    {
+                        if (std::abs(value) < m_llrErasureThreshold)
+                        {
+                            value = 0.0f;
+                            ++erasuresAfterThreshold;
+                        }
+
+                        sumAbsPostErasure += std::abs(value);
+                    }
+                }
+                else
+                {
+                    for (auto const value : llr) sumAbsPostErasure += std::abs(value);
+                }
+            };
+
+            applyErasureThreshold(llr0);
+            applyErasureThreshold(llr1);
+
+            if (decoder_js8().isDebugEnabled())
+            {
+                auto const total = static_cast<double>(llr0.size() + llr1.size());
+                double const avgPre  = total > 0.0 ? sumAbsPreErasure  / total : 0.0;
+                double const avgPost = total > 0.0 ? sumAbsPostErasure / total : 0.0;
+
+                qCDebug(decoder_js8) << "LLR erasure threshold"
+                                     << m_llrErasureThreshold
+                                     << "erasures:" << erasuresAfterThreshold
+                                     << "avg|LLR| pre/post:" << avgPre << avgPost;
+            }
+
             auto const ttl = std::chrono::seconds{Mode::NTXDUR * 2};
 
             m_softCombiner.flush(ttl);
@@ -2214,28 +2356,21 @@ namespace
             std::array<int8_t, K> decoded;
             std::array<int8_t, N> cw;
 
-            // Loop over decoding passes
-            for (int ipass = 1; ipass <= 4; ++ipass)
+            int  totalLdpcPasses      = 0;
+            bool usedFeedbackPass     = false;
+            bool feedbackTurnedSuccess= false;
+            int  feedbackConfident    = 0;
+            int  feedbackUncertain    = 0;
+
+            auto const tryDecode = [&](std::array<float, N> const & llrInput,
+                                       int                        ipass) -> std::optional<Decode>
             {
-                // LLR 0 used on passes 1, 3, and 4; LLR 1 used on pass 2.
-
-                auto & llr = ipass == 2 ? llr1Combined : llr0Combined;
-
-                // Zero the first 24 bytes of LLR 0 on the third pass;
-                // the first 48 bytes of LLR 0 on the fourth pass;
-
-                if      (ipass == 3) std::fill(llr0Combined.begin(),      llr0Combined.begin() + 24, 0.0f);
-                else if (ipass == 4) std::fill(llr0Combined.begin() + 24, llr0Combined.begin() + 48, 0.0f);
-
-                // Decode using belief propagation.
-
-                nharderrors = bpdecode174(llr, decoded, cw);
+                nharderrors = bpdecode174(llrInput, decoded, cw);
                 xsnr        = -99.0f;
 
-                // Check for all-zero codeword
                 if (std::all_of(cw.begin(), cw.end(), [](int x) { return x == 0; }))
                 {
-                    continue;
+                    return std::nullopt;
                 }
 
                 if (nharderrors >= 0    && nharderrors < 60  &&
@@ -2261,11 +2396,7 @@ namespace
 
                         JS8::encode(i3bit, Costas, message.data(), itone.data());
 
-                        // Subtract signal if needed.
-
                         if (lsubtract) subtractjs8(genjs8refsig(itone, f1), xdt2);
-
-                        // Compute the signal power.
 
                         float xsig = 0.0f;
 
@@ -2273,10 +2404,6 @@ namespace
                         {
                             xsig += std::pow(s2[itone[i]][i], 2);
                         }
-
-                        // Compute SNR, clamping results lower than -28 to -28.
-                        // Note that std::log10(1.259e-10) is about -9.9; we're
-                        // avoiding undefined behavior in the log10 computation.
 
                         xsnr = std::max(
                             10.0f * std::log10(std::max(
@@ -2294,6 +2421,74 @@ namespace
                 {
                     nharderrors = -1;
                 }
+
+                return std::nullopt;
+            };
+
+            // Loop over decoding passes
+            for (int ipass = 1; ipass <= 4 && totalLdpcPasses < m_maxLdpcPasses; ++ipass)
+            {
+                auto & llr = ipass == 2 ? llr1Combined : llr0Combined;
+
+                // Zero ranges for certain passes to mirror legacy behavior.
+                if      (ipass == 3) std::fill(llr0Combined.begin(),      llr0Combined.begin() + 24, 0.0f);
+                else if (ipass == 4) std::fill(llr0Combined.begin() + 24, llr0Combined.begin() + 48, 0.0f);
+
+                std::array<float, N> llrPrimary = llr;
+                if (auto result = tryDecode(llrPrimary, ipass))
+                {
+                    ++totalLdpcPasses;
+                    return result;
+                }
+                ++totalLdpcPasses;
+
+                // Feedback refinement and second attempt, if enabled and budget allows.
+                if (m_enableLdpcFeedback && totalLdpcPasses < m_maxLdpcPasses)
+                {
+                    std::array<float, N> llrRefined;
+                    int confident = 0;
+                    int uncertain = 0;
+                    refineLlrsWithLdpcFeedback(llrPrimary, cw, m_llrErasureThreshold, llrRefined, confident, uncertain);
+
+                    if (decoder_js8().isDebugEnabled())
+                    {
+                        qCDebug(decoder_js8) << "LDPC feedback pass"
+                                             << "ipass" << ipass
+                                             << "confident" << confident
+                                             << "uncertain" << uncertain;
+                    }
+
+                    usedFeedbackPass   = true;
+                    feedbackConfident += confident;
+                    feedbackUncertain += uncertain;
+
+                    if (auto result = tryDecode(llrRefined, ipass))
+                    {
+                        ++totalLdpcPasses;
+                        feedbackTurnedSuccess = true;
+                        if (decoder_js8().isDebugEnabled())
+                        {
+                            qCDebug(decoder_js8) << "LDPC feedback succeeded on second pass"
+                                                 << "ipass" << ipass
+                                                 << "confident" << feedbackConfident
+                                                 << "uncertain" << feedbackUncertain
+                                                 << "passes" << totalLdpcPasses;
+                        }
+                        return result;
+                    }
+
+                    ++totalLdpcPasses;
+                }
+            }
+
+            if (decoder_js8().isDebugEnabled())
+            {
+                qCDebug(decoder_js8) << "LDPC feedback summary"
+                                     << "used" << usedFeedbackPass
+                                     << "success" << feedbackTurnedSuccess
+                                     << "confident" << feedbackConfident
+                                     << "uncertain" << feedbackUncertain
+                                     << "passes" << totalLdpcPasses;
             }
 
             logTracker("fail");
