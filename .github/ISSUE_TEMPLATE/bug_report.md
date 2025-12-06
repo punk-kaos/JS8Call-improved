@@ -26,6 +26,8 @@ If applicable, add screenshots to help explain your problem.
 **Desktop (please complete the following information):**
  - OS: [e.g. Windows 10]
  - Version [e.g. 2.4.0]
+ - Radio(s)
+ - Direct to radio or via FLrig or others
 
 **Additional context**
 Add any other context about the problem here.
