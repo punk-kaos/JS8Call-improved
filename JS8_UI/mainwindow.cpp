@@ -6028,8 +6028,13 @@ void UI_Constructor::processIdleActivity() {
             continue;
         if (last.text == m_config.mfi())
             continue;
+        double const idleMultiplier =
+            (last.submode == Varicode::JS8CallTurbo ||
+             last.submode == Varicode::JS8CallUltra)
+                ? 1.10
+                : 1.50;
         if (last.utcTimestamp.secsTo(now) <
-            JS8::Submode::period(last.submode) * 1.50)
+            JS8::Submode::period(last.submode) * idleMultiplier)
             continue;
 
         ActivityDetail d = {};
