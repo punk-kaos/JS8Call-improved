@@ -24,7 +24,7 @@
 #define JS8_ENABLE_JS8B    1
 #define JS8_ENABLE_JS8C    1
 #define JS8_ENABLE_JS8E    1
-#define JS8_ENABLE_JS8I    0
+#define JS8_ENABLE_JS8I    1
 
 #define JS8A_SYMBOL_SAMPLES 1920
 #define JS8A_TX_SECONDS     15
@@ -43,7 +43,7 @@
 #define JS8E_START_DELAY_MS 500
 
 #define JS8I_SYMBOL_SAMPLES 384
-#define JS8I_TX_SECONDS     4
+#define JS8I_TX_SECONDS     3
 #define JS8I_START_DELAY_MS 100
 
 extern struct dec_data

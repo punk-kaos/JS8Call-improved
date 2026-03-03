@@ -346,10 +346,10 @@ struct ModeI {
     inline static constexpr int NSPS = JS8I_SYMBOL_SAMPLES;
     inline static constexpr int NTXDUR = JS8I_TX_SECONDS;
     inline static constexpr int NDOWNSPS = 12;
-    inline static constexpr int NDD = 125;
-    inline static constexpr int JZ = 250;
+    inline static constexpr int NDD = 120;
+    inline static constexpr int JZ = 140;
     inline static constexpr float ASTART = 0.1f;
-    inline static constexpr float BASESUB = 36.0f;
+    inline static constexpr float BASESUB = 38.0f;
 
     // Derived parameters
     inline static constexpr float AZ = (12000.0f / NSPS) * 0.64f;
