@@ -136,7 +136,7 @@ constexpr Data Turbo = {"TURBO",
 constexpr Data Slow = {
     "SLOW",          JS8E_SYMBOL_SAMPLES,    JS8E_START_DELAY_MS,
     JS8E_TX_SECONDS, Costas::Type::MODIFIED, -28};
-constexpr Data Ultra = {"JS8 3/250",
+constexpr Data Ultra = {"ULTRA",
                         JS8I_SYMBOL_SAMPLES,
                         JS8I_START_DELAY_MS,
                         JS8I_TX_SECONDS,

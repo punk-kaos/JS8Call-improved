@@ -2272,7 +2272,7 @@ background-color: #22ff22;
     <bool>true</bool>
    </property>
     <property name="text">
-     <string>JS8 (&amp;3/250, 3s, 250Hz, ~80 WPM)</string>
+     <string>JS8 (&amp;Ultra, 3s, 250Hz, ~80 WPM)</string>
     </property>
   </action>
   <action name="actionModeJS8HB">
