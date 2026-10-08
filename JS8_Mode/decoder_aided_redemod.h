@@ -30,6 +30,7 @@
  */
 
 #pragma once
+#include "fractional_window.h"
 
 #include <algorithm>
 #include <array>
@@ -251,14 +252,14 @@ struct MidpointResidual {
  * @brief First-pass per-symbol extraction metadata for the refinement baseline.
  *
  * `startSamples` is the ACTUAL first-pass window start (nominal base plus the
- * recorded TimingTracker integer shift, exactly as extracted), and
+ * recorded TimingTracker shift, exactly as extracted), and
  * `trackerHz` is the recorded FrequencyTracker estimate applied to that
  * symbol. The refinement baseline replays this tracked extraction, so the
  * gate compares refined hypotheses against the real first-pass
  * synchronization rather than an untracked approximation.
  */
 struct SymbolBaseline {
-    int startSamples = 0;  ///< First-pass window start (base + shift).
+    double startSamples = 0.0; ///< Actual (possibly fractional) window start.
     float trackerHz = 0.0f; ///< Recorded tracker estimate for the symbol.
 };
 
@@ -269,16 +270,16 @@ struct SymbolBaseline {
  * - coarse correction multiplies cd0 by exp(-j*2*pi*delfbest*t), then
  *   f1 += delfbest, so f1 is the physical center for zero cd0 residual;
  * - FrequencyTracker::apply() (and replayTrackerCorrection()) multiplies by
- *   exp(+j*2*pi*trackerHz*t_local), i.e. it ADDS trackerHz to the apparent
+ *   exp(-j*2*pi*trackerHz*t_local), i.e. it REMOVES trackerHz from the apparent
  *   residual, so a perfectly correcting tracker records
- *   trackerHz ~= -physicalResidualHz;
+ *   trackerHz ~= physicalResidualHz;
  * - the aided refinement derotates by exp(-j*(2*pi*aidedDf*t+pi*aidedDd*t^2))
  *   AFTER replaying the tracker correction, and the search centers the
  *   expected-tone peak, so at the optimum
- *       physicalResidual(t) ~= aidedDf + aidedDd*t - trackerHz(t).
+ *       physicalResidual(t) ~= aidedDf + aidedDd*t + trackerHz(t).
  *
  * The scalar seed is f1 + residual(midpoint). Per-symbol residuals
- * r_k = aidedDf + aidedDd*t_k - trackerHz[k] (t_k = window-center absolute
+ * r_k = aidedDf + aidedDd*t_k + trackerHz[k] (t_k = window-center absolute
  * time) are combined with a weighted linear fit evaluated at the frame
  * midpoint (weighted mean fallback); drift therefore enters through
  * aidedDd*t_mid and is never discarded. Weights are caller-provided (Costas
@@ -308,7 +309,7 @@ inline MidpointResidual aidedPhysicalResidualAtMidpoint(
         if (!std::isfinite(tracker) || !std::isfinite(start))
             return out;
         double const t = (start + window * 0.5) / sampleRateHz;
-        double const r = aidedDf + aidedDd * t - tracker;
+        double const r = aidedDf + aidedDd * t + tracker;
         if (!std::isfinite(t) || !std::isfinite(r))
             return out;
         tMin = std::min(tMin, t);
@@ -337,7 +338,7 @@ inline MidpointResidual aidedPhysicalResidualAtMidpoint(
         return out;
     out.residualHz = residual;
     out.midpointSeconds = tMid;
-    out.trackerHzAtMid = aidedDf + aidedDd * tMid - residual;
+    out.trackerHzAtMid = residual - aidedDf - aidedDd * tMid;
     out.valid = true;
     return out;
 }
@@ -355,12 +356,8 @@ symbolBoundsValid(std::array<SymbolBaseline, kTotalSymbols> const &baselines,
     if (window <= 0 || numSamples <= 0 || maxAbsDelta < 0)
         return false;
     for (auto const &base : baselines) {
-        long const first = static_cast<long>(base.startSamples) - maxAbsDelta;
-        long const last =
-            static_cast<long>(base.startSamples) + maxAbsDelta;
-        if (first < 0 || last < 0)
-            return false;
-        if (last + window > static_cast<long>(numSamples))
+        if (!fractionalWindowValid(base.startSamples - maxAbsDelta, window, numSamples) ||
+            !fractionalWindowValid(base.startSamples + maxAbsDelta, window, numSamples))
             return false;
     }
     return true;
@@ -369,8 +366,8 @@ symbolBoundsValid(std::array<SymbolBaseline, kTotalSymbols> const &baselines,
 /**
  * @brief Replay one symbol's recorded FrequencyTracker correction.
  *
- * This mirrors FrequencyTracker::apply() operation-for-operation (positive
- * rotation `wstep^(n+1)` with `wstep = exp(j*2*pi*trackerHz/sampleRateHz)`,
+ * This mirrors FrequencyTracker::apply() operation-for-operation (negative
+ * rotation `wstep^(n+1)` with `wstep = exp(-j*2*pi*trackerHz/sampleRateHz)`,
  * fresh phase every window, float arithmetic) so the aided baseline
  * reproduces the first-pass per-symbol extraction bit-faithfully for finite
  * inputs. The added finiteness guard only rejects corrupt input the decoder
@@ -384,7 +381,7 @@ inline bool replayTrackerCorrection(std::complex<float> *window, int count,
     if (window == nullptr || count <= 0 || !std::isfinite(trackerHz) ||
         !std::isfinite(sampleRateHz) || !(sampleRateHz > 0.0))
         return false;
-    double const dphi = 2.0 * std::numbers::pi * (trackerHz / sampleRateHz);
+    double const dphi = -2.0 * std::numbers::pi * (trackerHz / sampleRateHz);
     auto const wstep = std::polar(1.0f, static_cast<float>(dphi));
     auto w = std::complex<float>{1.0f, 0.0f};
     for (int i = 0; i < count; ++i) {
@@ -520,12 +517,11 @@ inline Refinement refineSync(std::complex<float> const *samples,
         for (int k = 0; k < kTotalSymbols; ++k) {
             if (!(weights[static_cast<std::size_t>(k)] > 0.0f))
                 continue;
-            int const start =
+            double const start =
                 baselines[static_cast<std::size_t>(k)].startSamples + dt;
             auto &entry = cached(dt, k);
-            for (int n = 0; n < window; ++n)
-                entry.samples[static_cast<std::size_t>(n)] = samples[start + n];
-            entry.usable = replayTrackerCorrection(
+            entry.usable = extractSymbolWindow(samples, numSamples, start, window,
+                                               entry.samples.data()) && replayTrackerCorrection(
                 entry.samples.data(), window,
                 baselines[static_cast<std::size_t>(k)].trackerHz,
                 sampleRateHz);
@@ -546,12 +542,11 @@ inline Refinement refineSync(std::complex<float> const *samples,
             float const w = weights[static_cast<std::size_t>(k)];
             if (!(w > 0.0f))
                 continue;
-            int const start =
+            double const start =
                 baselines[static_cast<std::size_t>(k)].startSamples + dt;
 #ifdef JS8_BENCHMARK_UNOPTIMIZED_HOTSPOTS
-            for (int n = 0; n < window; ++n)
-                replayed[n] = samples[start + n];
-            if (!replayTrackerCorrection(
+            if (!extractSymbolWindow(samples, numSamples, start, window, replayed) ||
+                !replayTrackerCorrection(
                     replayed, window,
                     baselines[static_cast<std::size_t>(k)].trackerHz,
                     sampleRateHz))

@@ -159,7 +159,7 @@ inline double effectiveSymbolTimeSeconds(double baseTimeSeconds,
 /// Remove the deterministic bulk phase of one FrequencyTracker::apply() call.
 ///
 /// apply() multiplies window sample n by `wstep^(n+1)` with
-/// `wstep = exp(j*2*pi*trackerHz/sampleRateHz)` and resets every symbol. For
+/// `wstep = exp(-j*2*pi*trackerHz/sampleRateHz)` and resets every symbol. For
 /// a bin-centered tone that contributes exactly
 /// `exp(j*dphi*(windowSamples+1)/2)` to the matched FFT bin, so dividing it
 /// out leaves the physical carrier trajectory plus only the residual error.
@@ -172,7 +172,7 @@ normalizeFrequencyTrackerPhase(std::complex<double> bin, double trackerHz,
         return {std::numeric_limits<double>::quiet_NaN(),
                 std::numeric_limits<double>::quiet_NaN()};
     double const dphi =
-        2.0 * std::numbers::pi * trackerHz / sampleRateHz;
+        -2.0 * std::numbers::pi * trackerHz / sampleRateHz;
     return bin *
            std::exp(std::complex<double>{
                0.0, -dphi * (static_cast<double>(windowSamples) + 1.0) * 0.5});
@@ -209,11 +209,15 @@ normalizeTimingPhase(std::complex<double> bin, int tone, double shiftSamples,
 /// @param minSpanSeconds Minimum time span across valid pilots.
 /// @param windowSamples Decoder symbol FFT length (Mode::NDOWNSPS).
 /// @param sampleRateHz Decoder downsampled rate (post-downsample Hz).
+/// @param maxDeltaFHz Residual-frequency bound; legacy default is unchanged.
+/// @param maxDriftHzPerSec Drift bound; expanded only for trusted pilot steering.
 /// @return Fit result; `fitted` is false on any degenerate/ambiguous input.
 inline CarrierPhaseFit
 fitCarrierPhase(std::vector<CoherentPilot> const &pilots, int minPilots,
                 double minSpanSeconds, int windowSamples,
-                double sampleRateHz) {
+                double sampleRateHz,
+                double maxDeltaFHz = detail::kMaxDeltaFHz,
+                double maxDriftHzPerSec = detail::kMaxDriftHzPerSec) {
     CarrierPhaseFit fit;
 
     struct NormalizedPilot {
@@ -387,8 +391,9 @@ fitCarrierPhase(std::vector<CoherentPilot> const &pilots, int minPilots,
         phi0Previous = correction;
     }
 
-    if (std::abs(deltaF) >= detail::kMaxDeltaFHz ||
-        std::abs(fdot) >= detail::kMaxDriftHzPerSec)
+    if (!(maxDeltaFHz > 0.0) || !std::isfinite(maxDeltaFHz) ||
+        !(maxDriftHzPerSec > 0.0) || !std::isfinite(maxDriftHzPerSec) ||
+        std::abs(deltaF) >= maxDeltaFHz || std::abs(fdot) >= maxDriftHzPerSec)
         return fit;
 
     double residualSum = 0.0;
@@ -536,13 +541,16 @@ struct CoherentToneResult {
 inline CoherentToneResult computeCoherentToneScores(
     std::vector<CoherentPilot> const &pilots,
     std::vector<CoherentDataSymbol> const &data, int minPilots,
-    double minSpanSeconds, int windowSamples, double sampleRateHz) {
+    double minSpanSeconds, int windowSamples, double sampleRateHz,
+    double maxDeltaFHz = detail::kMaxDeltaFHz,
+    double maxDriftHzPerSec = detail::kMaxDriftHzPerSec) {
     CoherentToneResult result;
     if (windowSamples <= 0 || !(sampleRateHz > 0.0))
         return result;
 
     CarrierPhaseFit const fit = fitCarrierPhase(
-        pilots, minPilots, minSpanSeconds, windowSamples, sampleRateHz);
+        pilots, minPilots, minSpanSeconds, windowSamples, sampleRateHz,
+        maxDeltaFHz, maxDriftHzPerSec);
     result.telemetry.fitted = fit.fitted;
     result.telemetry.pilotCount = fit.pilotCount;
     result.telemetry.phaseRmsRad = fit.rmsRad;
@@ -579,7 +587,7 @@ inline CoherentToneResult computeCoherentToneScores(
         // the tracker, tone-dependent timing, and carrier multiplies in the
         // original order; only reuse the two shared exponentials.
         double const dphi =
-            2.0 * std::numbers::pi * symbol.trackerHz / sampleRateHz;
+            -2.0 * std::numbers::pi * symbol.trackerHz / sampleRateHz;
         std::complex<double> const trackerRotation =
             std::exp(std::complex<double>{
                 0.0, -dphi * (static_cast<double>(windowSamples) + 1.0) * 0.5});

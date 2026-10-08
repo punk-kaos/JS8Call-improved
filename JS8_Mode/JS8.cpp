@@ -12,6 +12,7 @@
 #include "JS8_Mode/whitening_processor.h"
 #include "decoder_aided_redemod.h"
 #include "ldpc_feedback.h"
+#include "pilot_refinement.h"
 #include "soft_combiner.h"
 
 #include <QDebug>
@@ -24,7 +25,6 @@
 #include <boost/math/ccmath/round.hpp>
 #include <boost/multi_index/key.hpp>
 #include <boost/multi_index/ordered_index.hpp>
-#include <boost/multi_index/ranked_index.hpp>
 #include <boost/multi_index_container.hpp>
 #include <chrono>
 #include <cmath>
@@ -169,9 +169,7 @@ namespace {
 // parameter (NS=21)                     !Sync symbols (3 @ Costas 7x7)
 // parameter (NN=NS+ND)                  !Total channel symbols (79)
 // parameter (ASYNCMIN=1.5)              !Minimum Sync
-// parameter (NFSRCH=5)                  !Search frequency range in Hz (i.e.,
-// +/- 2.5 Hz) parameter (NMAXCAND=300)              !Maximum number of
-// candidate signals
+// parameter (NMAXCAND=300)              !Maximum number of candidate signals
 
 // Parameter	Value	Description
 // KK	87	Number of information bits (75 message bits + 12 CRC bits).
@@ -179,7 +177,7 @@ namespace {
 // NS	21	Number of synchronization symbols (3 Costas arrays of size 7).
 // NN	79	Total number of channel symbols (NN = NS + ND).
 // ASYNCMIN	1.5	Minimum sync value for successful decoding.
-// NFSRCH	5	Search frequency range in Hz (±2.5 Hz).
+// Fine-sync frequency capture and spacing are derived from each mode's baud.
 // NMAXCAND	300	Maximum number of candidate signals.
 
 constexpr int N = 174;           // Total bits
@@ -192,15 +190,14 @@ constexpr int NN = NS + ND;      // Total channel symbols (79)
 constexpr float ASYNCMIN = 1.5f; // Normal coarse-sync threshold
 constexpr float ASYNCDEEP = 1.20f; // Bounded fallback coarse-sync threshold
 constexpr float SOFT_COSTAS_MIN = 1.5f; // Minimum soft Costas power ratio
-constexpr int NFSRCH = 5; // Search frequency range in Hz (i.e., +/- 2.5 Hz)
 constexpr std::size_t NMAXCAND = 300; // Maximum normal candidates
 constexpr std::size_t NMAXDEEP = 24; // Maximum deep-search candidates
+constexpr std::size_t NMAXSECONDARY = 24; // Additional timing hypotheses per pass
 constexpr int NFILT = 1400;           // Filter length
 constexpr int NROWS = 8;
 constexpr int NFOS = 2;
 constexpr int NSSY = 4;
 constexpr int NP = 3200;
-constexpr int NP2 = 2812;
 constexpr float TAU = 2.0f * std::numbers::pi_v<float>;
 constexpr auto ZERO = std::complex<float>{0.0f, 0.0f};
 // Key for the constants that follow:
@@ -541,11 +538,13 @@ struct Sync {
     float freq;
     float step;
     float sync;
+    bool secondary; // Not the strongest timing peak of this frequency bin.
 
     // Constructor for convenience.
 
-    Sync(float const freq, float const step, float const sync)
-        : freq(freq), step(step), sync(sync) {}
+    Sync(float const freq, float const step, float const sync,
+         bool const secondary = false)
+        : freq(freq), step(step), sync(sync), secondary(secondary) {}
 };
 
 struct SyncCandidates {
@@ -561,7 +560,6 @@ struct SyncCandidates {
 
 namespace Tag {
 struct Freq {};
-struct Rank {};
 struct Sync {};
 } // namespace Tag
 
@@ -571,7 +569,6 @@ namespace MI = boost::multi_index;
 using SyncIndex = MI::multi_index_container<
     Sync, MI::indexed_by<
               MI::ordered_non_unique<MI::tag<Tag::Freq>, MI::key<&Sync::freq>>,
-              MI::ranked_non_unique<MI::tag<Tag::Rank>, MI::key<&Sync::sync>>,
               MI::ordered_non_unique<MI::tag<Tag::Sync>, MI::key<&Sync::sync>,
                                      std::greater<>>>>;
 
@@ -1236,6 +1233,11 @@ constexpr auto parity = []() {
 
 namespace {
 template <typename Mode> class DecodeMode {
+    static_assert(Mode::NP2 <= Mode::NDFFT2,
+                  "generated baseband must accommodate a complete JS8 frame");
+#ifdef JS8_DECODER_TEST_ACCESS
+  public:
+#endif
     // Data members
 
     std::array<float, Mode::NFFT1> nuttal;
@@ -1244,9 +1246,24 @@ template <typename Mode> class DecodeMode {
                               7>,
                    3>;
     SyncWaveforms csyncs;
-    // The coarse frequency grid is identical for all timing offsets and
-    // candidates of this mode. Construct each exact pilot reference once.
-    std::array<SyncWaveforms, 2 * NFSRCH + 1> coarseCsyncs;
+    // Quantize spacing to a simple grid based on the seven-symbol observation
+    // duration. Worst-case coherent grid loss is 0.44..1.15 dB across modes.
+    // Keep the proven 0.5/0.1-Hz grids in Normal/Fast, while Slow needs a denser
+    // grid and the shortest modes need a wider capture. Half a bin is DF/2;
+    // one additional coarse step provides margin around that uncertainty.
+    static constexpr float kPilotSeconds = 7.0f * Mode::NSPS / 12000.0f;
+    static constexpr float kCoarseHz = kPilotSeconds > 2.0f ? 0.2f :
+        kPilotSeconds > 0.5f ? 0.5f : kPilotSeconds > 0.3f ? 1.0f : 2.0f;
+    static constexpr int kCoarseRadius = std::max(5,
+        static_cast<int>(Mode::DF * 0.5f / kCoarseHz + 0.9999f) + 1);
+    static constexpr int kBoundaryExtension = 2;
+    static constexpr int kFineDivisions = 5;
+    static constexpr float kFineHz = kCoarseHz / kFineDivisions;
+    static constexpr int kFineRadius =
+        (kCoarseRadius + kBoundaryExtension + 1) * kFineDivisions;
+    // References cover both stages, including the single bounded extension.
+    // All timing hypotheses reuse these exact phase trajectories.
+    std::array<SyncWaveforms, 2 * kFineRadius + 1> syncReferences;
     alignas(64) std::array<std::complex<float>, Mode::NDOWNSPS> csymb;
     alignas(64) std::array<std::complex<float>, Mode::NMAX> filter;
     alignas(64) std::array<std::complex<float>, Mode::NMAX> cfilt;
@@ -1254,6 +1271,44 @@ template <typename Mode> class DecodeMode {
     alignas(64) std::array<std::complex<float>, Mode::NFFT1 / 2 + 1> sd;
     alignas(64) std::array<std::complex<float>, NP> cd0;
     std::array<float, Mode::NMAX> dd;
+    int m_receivedSamples = 0;
+    int m_basebandSamples = 0; // Observed prefix, excludes FFT zero padding.
+    int m_spectrumCount = 0;
+
+    bool symbolWindowValid(int start, int count = Mode::NDOWNSPS) const {
+        return start >= 0 && count > 0 &&
+               start <= m_basebandSamples - count;
+    }
+
+    std::optional<float> pilotResidualHz(int tone, float sampleRate) const {
+        if (tone < 0 || tone >= Mode::NDOWNSPS)
+            return std::nullopt;
+        float const center = std::norm(csymb[tone]);
+        float const plus = std::norm(csymb[(tone + 1) % Mode::NDOWNSPS]);
+        float const minus = std::norm(csymb[(tone + Mode::NDOWNSPS - 1) %
+                                          Mode::NDOWNSPS]);
+        if (!(center > 0.0f) || !std::isfinite(center) ||
+            center / (plus + minus + 1e-12f) < 1.5f)
+            return std::nullopt;
+        float const denominator = minus - 2.0f * center + plus;
+        if (!std::isfinite(denominator) || std::abs(denominator) < 1e-9f)
+            return std::nullopt;
+        float const delta = std::clamp(0.5f * (minus - plus) / denominator,
+                                       -0.5f, 0.5f);
+        return delta * sampleRate / Mode::NDOWNSPS;
+    }
+
+    static float matchedToneEnergy(
+        std::array<std::complex<float>, Mode::NDOWNSPS> const &samples,
+        int tone) {
+        auto const step = std::polar(1.0f, -TAU * tone / Mode::NDOWNSPS);
+        std::complex<float> phase{1.0f, 0.0f}, sum{};
+        for (auto const &sample : samples) {
+            sum += sample * phase;
+            phase *= step;
+        }
+        return std::norm(sum);
+    }
     std::array<std::array<float, Mode::NHSYM>, Mode::NSPS> s;
     std::array<float, Mode::NSPS> savg;
     FFTWPlanManager plans;
@@ -1265,6 +1320,8 @@ template <typename Mode> class DecodeMode {
     bool m_enableLdpcRescue = true;
     bool m_enableCoherentData = true;
     bool m_enableAidedRedemod = true;
+    bool m_enablePilotSmoothing = true;
+    bool m_enableFractionalTiming = true;
     float m_llrErasureThreshold = js8::llrErasureThreshold();
     float m_llrScale = js8::llrGlobalScale();
     bool m_normalizeLlrsForBenchmark =
@@ -1342,9 +1399,11 @@ template <typename Mode> class DecodeMode {
         std::array<std::array<float, NN>, NROWS> const &s2,
         std::array<std::array<std::complex<float>, NN>, NROWS> const
             &complexS2,
-        std::array<int, NN> const &symbolBaseStarts,
-        std::array<int, NN> const &symbolTimingShifts,
-        std::array<float, NN> const &symbolTrackerHz) {
+        std::array<double, NN> const &symbolBaseStarts,
+        std::array<double, NN> const &symbolTimingShifts,
+        std::array<float, NN> const &symbolTrackerHz,
+        std::array<bool, NN> const &symbolValid,
+        bool pilotRefined = false) {
 #ifdef JS8_CPU_BENCHMARK
         BenchmarkScope benchmarkScope{benchmarkToneBinsCalls,
                                       benchmarkToneBinsNanos};
@@ -1352,6 +1411,9 @@ template <typename Mode> class DecodeMode {
         constexpr float FS2 = 12000.0f / Mode::NDOWN;
 
         std::array<std::array<float, ND>, NROWS> s1;
+        std::array<bool, ND> dataObserved{};
+        for (int j = 0; j < ND; ++j)
+            dataObserved[j] = symbolValid[j < 29 ? j + 7 : j + 14];
 
         // Fill s1 from s2, excluding the Costas arrays.
 
@@ -1396,6 +1458,8 @@ template <typename Mode> class DecodeMode {
             for (int block = 0; block < 3; ++block) {
                 for (int column = 0; column < 7; ++column) {
                     int const symbolIndex = block * 36 + column;
+                    if (!symbolValid[symbolIndex])
+                        continue;
                     int const expectedTone = Costas[block][column];
                     std::complex<float> const bin =
                         complexS2[expectedTone][symbolIndex];
@@ -1483,7 +1547,10 @@ template <typename Mode> class DecodeMode {
                             js8::computeCoherentToneScores(
                                 pilots, dataSymbols, 12,
                                 0.5 * frameSpanSeconds, Mode::NDOWNSPS,
-                                static_cast<double>(FS2));
+                                static_cast<double>(FS2),
+                                pilotRefined ? (FS2 / Mode::NDOWNSPS) * 0.45 : js8::detail::kMaxDeltaFHz,
+                                pilotRefined ? js8::pilot::kMaximumDriftHzPerSecond :
+                                               js8::detail::kMaxDriftHzPerSec);
 #ifdef JS8_CPU_BENCHMARK
                         ++benchmarkCoherentCalls;
                         benchmarkCoherentNanos +=
@@ -1518,7 +1585,8 @@ template <typename Mode> class DecodeMode {
             decoder_js8().isDebugEnabled(), coherentBlend, m_llrScale,
             m_normalizeLlrsForBenchmark
                 ? js8::WhiteningProcessor<NROWS, ND, N>::Normalization::FrameSigma283
-                : js8::WhiteningProcessor<NROWS, ND, N>::Normalization::None);
+                : js8::WhiteningProcessor<NROWS, ND, N>::Normalization::None,
+            &dataObserved);
 
         if (decoder_js8().isDebugEnabled()) {
             qCDebug(decoder_js8)
@@ -1592,6 +1660,386 @@ template <typename Mode> class DecodeMode {
         return out;
     }
 
+    struct FineSync {
+        int start = 0;
+        float residualHz = 0.0f;
+        float power = 0.0f;
+        int evaluations = 0;
+        bool extended = false;
+        bool atBoundary = false;
+    };
+
+    std::optional<FineSync> findFineSync(int initialStart) {
+#ifdef JS8_BENCHMARK_LEGACY_FINE_SYNC
+        // Checkpoint A/B reference for isolating acquisition-search changes.
+        FineSync legacy;
+        for (int start = initialStart - Mode::NQSYMBOL;
+             start <= initialStart + Mode::NQSYMBOL; ++start) {
+            for (int grid = -5; grid <= 5; ++grid) {
+                float const hz = grid * 0.5f;
+                float const power = syncjs8d(start, hz);
+                ++legacy.evaluations;
+                if (power > legacy.power) {
+                    legacy.start = start;
+                    legacy.residualHz = hz;
+                    legacy.power = power;
+                }
+            }
+        }
+        if (!(legacy.power > 0.0f)) return std::nullopt;
+        float const center = legacy.residualHz;
+        legacy.power = 0.0f;
+        for (int grid = -5; grid <= 5; ++grid) {
+            float const hz = center + grid * 0.1f;
+            float const power = syncjs8d(legacy.start, hz);
+            ++legacy.evaluations;
+            if (power > legacy.power) {
+                legacy.residualHz = hz;
+                legacy.power = power;
+            }
+        }
+        return legacy;
+#else
+        struct Point { int start; int grid; float power; };
+        constexpr int timeCount = 2 * Mode::NQSYMBOL + 1;
+        std::array<Point, timeCount * (2 * kCoarseRadius + 1 +
+                                      kBoundaryExtension)> points{};
+        int count = 0;
+        FineSync result;
+        auto const score = [&](int start, int grid) {
+            float const hz = grid * kFineHz;
+#ifdef JS8_BENCHMARK_ORIGINAL_COARSE_SYNC
+            float const power = syncjs8d(start, hz);
+#else
+            float const power = syncjs8d<true>(
+                start, hz, &syncReferences[grid + kFineRadius]);
+#endif
+#ifdef JS8_BENCHMARK_VERIFY_COARSE_SYNC
+            float const original = syncjs8d(start, hz);
+            if (std::memcmp(&power, &original, sizeof(power)) != 0)
+                ++benchmarkSyncMismatches;
+#endif
+            ++result.evaluations;
+            return std::isfinite(power) && power > 0.0f ? power : 0.0f;
+        };
+        auto const scan = [&](int coarseIndex) {
+            int const grid = coarseIndex * kFineDivisions;
+            for (int start = initialStart - Mode::NQSYMBOL;
+                 start <= initialStart + Mode::NQSYMBOL; ++start)
+                points[count++] = Point{start, grid, score(start, grid)};
+        };
+        for (int index = -kCoarseRadius; index <= kCoarseRadius; ++index)
+            scan(index);
+        auto const stronger = [](Point const &a, Point const &b) {
+            if (a.power != b.power) return a.power > b.power;
+            if (a.start != b.start) return a.start < b.start;
+            return a.grid < b.grid;
+        };
+        Point best = *std::max_element(points.begin(), points.begin() + count,
+            [&](Point const &a, Point const &b) { return stronger(b, a); });
+        if (!(best.power > 0.0f))
+            return std::nullopt;
+        if (std::abs(best.grid) == kCoarseRadius * kFineDivisions) {
+            result.extended = true;
+            int const direction = best.grid > 0 ? 1 : -1;
+            for (int extra = 1; extra <= kBoundaryExtension; ++extra)
+                scan(direction * (kCoarseRadius + extra));
+        }
+        std::sort(points.begin(), points.begin() + count, stronger);
+        // Refine at most two distinct coarse neighborhoods, jointly in time
+        // and frequency. No recursive widening or unbounded hypothesis list.
+        std::array<Point, 2> seeds{points[0], points[0]};
+        int seedCount = 1;
+        for (int i = 1; i < count; ++i) {
+            if (points[i].power > 0.0f &&
+                (std::abs(points[i].start - seeds[0].start) > 1 ||
+                 std::abs(points[i].grid - seeds[0].grid) > kFineDivisions)) {
+                seeds[seedCount++] = points[i];
+                break;
+            }
+        }
+        best = points[0];
+        Point fixedTiming = best;
+        for (int seed = 0; seed < seedCount; ++seed) {
+            for (int grid = seeds[seed].grid - kFineDivisions;
+                 grid <= seeds[seed].grid + kFineDivisions; ++grid) {
+                // Refine inside the original timing envelope. Frequency-edge
+                // extension must not silently widen timing capture as well.
+                int const first = std::max(seeds[seed].start - 1,
+                                          initialStart - Mode::NQSYMBOL);
+                int const last = std::min(seeds[seed].start + 1,
+                                         initialStart + Mode::NQSYMBOL);
+                for (int start = first; start <= last; ++start) {
+                    Point const p{start, grid, score(start, grid)};
+                    if (stronger(p, best)) best = p;
+                    if (p.start == points[0].start && stronger(p, fixedTiming))
+                        fixedTiming = p;
+                }
+            }
+        }
+        // A tiny in-sample pilot gain is often timing noise, not a better
+        // symbol boundary. Require a meaningful gain before moving the
+        // jointly acquired timing during local frequency refinement.
+        if (best.start != fixedTiming.start) {
+            std::array<float, 3> movedBlocks{}, fixedBlocks{};
+            syncjs8d(best.start, best.grid * kFineHz, nullptr, &movedBlocks);
+            syncjs8d(fixedTiming.start, fixedTiming.grid * kFineHz, nullptr, &fixedBlocks);
+            result.evaluations += 2;
+            int support = 0;
+            int observed = 0;
+            for (int block = 0; block < 3; ++block) {
+                observed += movedBlocks[block] > 0.0f || fixedBlocks[block] > 0.0f;
+                support += movedBlocks[block] > fixedBlocks[block] * 1.01f;
+            }
+            // All observed blocks must independently support the move; a
+            // single exceptionally strong/noisy block must not dominate it.
+            if (best.power < fixedTiming.power * 1.05f || observed < 2 ||
+                support != observed)
+                best = fixedTiming;
+        }
+        result.start = best.start;
+        result.residualHz = best.grid * kFineHz;
+        result.power = best.power;
+        result.atBoundary = std::abs(best.grid) == kFineRadius;
+        return result;
+#endif
+    }
+
+    static constexpr std::size_t kTimingPeaksPerBin = 3;
+    using TimingScores = std::array<float, 2 * Mode::JZ + 1>;
+
+    static bool nearbyTiming(float a, float b) {
+        // Coarse timestamps are quarter-symbol multiples represented as floats.
+        return std::abs(a - b) <= (NSSY + 1e-4f) * Mode::TSTEP;
+    }
+
+    static std::vector<Sync> timingPeaks(float frequency,
+                                        TimingScores const &scores) {
+#ifdef JS8_BENCHMARK_SINGLE_TIMING_PEAK
+        auto const best = std::max_element(scores.begin(), scores.end());
+        if (!std::isfinite(*best) || !(*best > 0.0f)) return {};
+        return {Sync{frequency,
+            Mode::TSTEP * (std::distance(scores.begin(), best) - Mode::JZ + 0.5f),
+            *best}};
+#else
+        std::array<int, 2 * Mode::JZ + 1> maxima{};
+        int count = 0;
+        auto const value = [&](int index) {
+            return index >= 0 && index < static_cast<int>(scores.size()) &&
+                   std::isfinite(scores[index]) ? scores[index] : 0.0f;
+        };
+        for (int i = 0; i < static_cast<int>(scores.size()); ++i) {
+            // Keep the first cell of an equal-score plateau deterministically.
+            if (value(i) > 0.0f && value(i) > value(i - 1) &&
+                value(i) >= value(i + 1))
+                maxima[count++] = i;
+        }
+        std::sort(maxima.begin(), maxima.begin() + count, [&](int a, int b) {
+            return scores[a] != scores[b] ? scores[a] > scores[b] : a < b;
+        });
+        std::vector<Sync> peaks;
+        peaks.reserve(kTimingPeaksPerBin);
+        for (int n = 0; n < count && peaks.size() < kTimingPeaksPerBin; ++n) {
+            float const step = Mode::TSTEP * (maxima[n] - Mode::JZ + 0.5f);
+            bool const duplicate = std::any_of(peaks.begin(), peaks.end(),
+                [&](Sync const &p) {
+                    return nearbyTiming(p.step, step);
+                });
+            if (!duplicate)
+                peaks.emplace_back(frequency, step, scores[maxima[n]], !peaks.empty());
+        }
+        return peaks;
+#endif
+    }
+
+    SyncCandidates extractSyncCandidates() {
+        auto &frequency = sync.get<Tag::Freq>();
+        auto &ranked = sync.get<Tag::Sync>();
+        SyncCandidates candidates;
+        std::size_t secondaryCount = 0;
+        while (!ranked.empty()) {
+            Sync const selected = *ranked.begin();
+            if (!std::isfinite(selected.sync) || selected.sync < ASYNCDEEP)
+                break;
+            if (selected.secondary && secondaryCount >= NMAXSECONDARY) {
+                // Budget exhaustion must not suppress a nearby primary peak.
+                ranked.erase(ranked.begin());
+                continue;
+            }
+            if (selected.sync >= ASYNCMIN) {
+                if (candidates.normal.size() >= NMAXCAND) break;
+                candidates.normal.push_back(selected);
+            } else {
+                if (!m_enableDeepSearch || candidates.deep.size() >= NMAXDEEP)
+                    break;
+                candidates.deep.push_back(selected);
+            }
+            secondaryCount += selected.secondary;
+            // Suppress only neighbors close in BOTH coordinates. Copy the
+            // winner first: erasing it invalidates its index iterators.
+            auto it = frequency.lower_bound(selected.freq - Mode::AZ);
+            auto const end = frequency.upper_bound(selected.freq + Mode::AZ);
+            while (it != end) {
+#ifndef JS8_BENCHMARK_FREQUENCY_ONLY_SUPPRESSION
+                bool const duplicate = nearbyTiming(it->step, selected.step);
+#else
+                bool const duplicate = true;
+#endif
+                if (duplicate)
+                    it = frequency.erase(it);
+                else ++it;
+            }
+        }
+        return candidates;
+    }
+
+    bool normalizeSync(std::vector<float> &frequencyMaxima) {
+        if (frequencyMaxima.empty() ||
+            !std::all_of(frequencyMaxima.begin(), frequencyMaxima.end(),
+                         [](float v) { return std::isfinite(v) && v >= 0.0f; }))
+            return false;
+        auto const percentile = frequencyMaxima.begin() +
+                                frequencyMaxima.size() * 4 / 10;
+        std::nth_element(frequencyMaxima.begin(), percentile, frequencyMaxima.end());
+        float const reference = *percentile;
+        if (!(reference > 0.0f)) return false;
+        auto &frequency = sync.get<Tag::Freq>();
+        for (auto it = frequency.begin(); it != frequency.end(); ++it)
+            frequency.modify(it, [reference](Sync &entry) {
+                entry.sync /= reference;
+            });
+        return true;
+    }
+
+    using Magnitudes = std::array<std::array<float, NN>, NROWS>;
+    using ComplexBins = std::array<std::array<std::complex<float>, NN>, NROWS>;
+    using SymbolTimes = std::array<double, NN>;
+
+    std::vector<js8::pilot::Observation> pilotObservations(
+        Magnitudes const &mags, ComplexBins const &bins, SymbolTimes const &bases,
+        SymbolTimes const &shifts, std::array<float, NN> const &hz,
+        std::array<bool, NN> const &valid) const {
+        constexpr double rate = 12000.0 / Mode::NDOWN;
+        std::vector<js8::pilot::Observation> observations;
+        observations.reserve(NS);
+        for (int block = 0; block < 3; ++block) {
+            for (int column = 0; column < 7; ++column) {
+                int const k = 36 * block + column;
+                int const expected = Costas[block][column];
+                if (!valid[k]) continue;
+                double noise = 0.0;
+                bool winner = true;
+                for (int tone = 0; tone < 8; ++tone) {
+                    if (tone==expected) continue;
+                    noise+=std::norm(bins[tone][k]);
+                    winner &= mags[expected][k] >= mags[tone][k];
+                }
+                observations.push_back({js8::CoherentPilot{
+                    bases[k]/rate, std::complex<double>(bins[expected][k]), expected,
+                    k, shifts[k], hz[k]}, noise/7.0, winner});
+            }
+        }
+        return observations;
+    }
+
+    std::optional<js8::pilot::Model> refinePilots(
+        Magnitudes &mags, ComplexBins &bins, SymbolTimes &bases,
+        SymbolTimes &shifts, std::array<float, NN> &hz,
+        std::array<bool, NN> &valid) {
+        constexpr double rate=12000.0/Mode::NDOWN;
+        bool const frequency=m_enablePilotSmoothing && m_enableFreqTracking;
+        bool const timing=m_enableFractionalTiming && m_enableTimingTracking;
+        if (!frequency && !timing) return std::nullopt;
+        auto const model=js8::pilot::fit(pilotObservations(mags,bins,bases,shifts,hz,valid),
+                                        Mode::NDOWNSPS,rate,timing);
+        if (decoder_js8().isDebugEnabled() && model.fits>0)
+            qCDebug(decoder_js8) << "pilot proposal" << "trusted" << model.trusted
+                << "fits" << model.fits << "rms" << model.carrier.rmsRad
+                << "delta" << model.timingDeltaSamples
+                << "rate" << model.timingRateSamplesPerSecond;
+        if (!model.trusted) return std::nullopt;
+        double timingChange = 0.0, frequencyChange = 0.0;
+        for (int k=0; k<NN; ++k) {
+            double const t=(bases[k]+shifts[k]+Mode::NDOWNSPS*0.5)/rate;
+            timingChange=std::max(timingChange,std::abs(model.timingAt(t)));
+            frequencyChange=std::max(frequencyChange,std::abs(model.frequencyAt(t)-hz[k]));
+        }
+        if ((!timing || timingChange<0.10) &&
+            (!frequency || frequencyChange<0.01*rate/Mode::NDOWNSPS))
+            return std::nullopt;
+        Magnitudes proposed{};
+        ComplexBins proposedBins{};
+        SymbolTimes proposedBases=bases;
+        std::array<float, NN> proposedHz=hz;
+        std::array<bool, NN> proposedValid{};
+        for (int k=0; k<NN; ++k) {
+            double const t=(bases[k]+shifts[k]+Mode::NDOWNSPS*0.5)/rate;
+            if (timing) proposedBases[k]+=model.timingAt(t);
+            double const start=proposedBases[k]+shifts[k];
+            if (frequency) proposedHz[k]=static_cast<float>(
+                model.frequencyAt((start+Mode::NDOWNSPS*0.5)/rate));
+            if (!valid[k]) continue;
+            if (!js8::extractSymbolWindow(cd0.data(),m_basebandSamples,start,
+                                           Mode::NDOWNSPS,csymb.data()) ||
+                !js8::aided::replayTrackerCorrection(csymb.data(),Mode::NDOWNSPS,
+                                                    proposedHz[k],rate))
+                return std::nullopt; // Never lose previously observed data.
+            fftwf_execute(plans[Plan::CS]);
+            proposedValid[k]=true;
+            for (int tone=0; tone<8; ++tone) {
+                proposedBins[tone][k]=csymb[tone]/1000.0f;
+                proposed[tone][k]=std::abs(proposedBins[tone][k]);
+            }
+        }
+        auto const fresh=js8::pilot::fit(pilotObservations(proposed,proposedBins,
+            proposedBases,shifts,proposedHz,proposedValid),Mode::NDOWNSPS,rate,false);
+        if (decoder_js8().isDebugEnabled())
+            qCDebug(decoder_js8) << "pilot fresh" << "trusted" << fresh.trusted
+                << "rms" << fresh.carrier.rmsRad << "fits" << fresh.fits;
+        if (!fresh.trusted) return std::nullopt;
+        // Fresh pilot contrast must not materially degrade any block. Timing
+        // correction may improve phase without increasing in-sample power.
+        double oldTotal = 0.0, newTotal = 0.0;
+        for (int b = 0; b < 3; ++b) {
+            double oldContrast = 0.0, newContrast = 0.0;
+            for (int c = 0; c < 7; ++c) {
+                int const k = b * 36 + c;
+                int const tone = Costas[b][c];
+                double a=std::norm(bins[tone][k]), z=std::norm(proposedBins[tone][k]);
+                for (int other=0; other<8; ++other) {
+                    if (other==tone) continue;
+                    a-=std::norm(bins[other][k])/7.0;
+                    z-=std::norm(proposedBins[other][k])/7.0;
+                }
+                oldContrast += a;
+                newContrast += z;
+            }
+            if (!(oldContrast>0.0) || newContrast<oldContrast*0.95) return std::nullopt;
+            oldTotal += oldContrast;
+            newTotal += newContrast;
+        }
+        if (newTotal<oldTotal*(timing && timingChange>=0.10 ? 0.99 : 1.005))
+            return std::nullopt;
+        mags = proposed;
+        bins = proposedBins;
+        bases = proposedBases;
+        hz = proposedHz;
+        valid = proposedValid;
+        if (decoder_js8().isDebugEnabled()) {
+            qCDebug(decoder_js8) << "pilot refinement accepted"
+                << "timingDelta" << model.timingDeltaSamples
+                << "timingRate" << model.timingRateSamplesPerSecond
+                << "frequency" << model.carrier.deltaF << "drift" << model.carrier.fdot
+                << "phaseRms" << fresh.carrier.rmsRad << "fits" << model.fits+fresh.fits;
+        }
+        auto accepted=model;
+        // Re-extracted pilots give the final physical carrier estimate. The
+        // recorded per-symbol corrections remain the exact ones replayed.
+        accepted.carrier=fresh.carrier;
+        accepted.frequencyRefSeconds=fresh.frequencyRefSeconds;
+        return accepted;
+    }
+
     std::optional<Decode> js8dec(bool const syncStats, bool const lsubtract,
                                  float &f1, float &xdt, int &nharderrors,
                                  float &xsnr, int &ldpcRescueBudget,
@@ -1613,64 +2061,26 @@ template <typename Mode> class DecodeMode {
         float const xbase =
             std::pow(10.0f, scaled_value); // Convert to linear scale
 
-        float delfbest = 0.0f;
-        int ibest = 0;
-
         // Downsample the signal and prepare for processing.
 
         js8_downsample(f1);
 
-        // Jointly search timing and coarse residual frequency. Coherent
-        // integration across seven symbols is much more sensitive to residual
-        // frequency error than the legacy per-symbol metric, so timing cannot
-        // safely be selected at delf=0 alone.
-
-        int i0 = static_cast<int>(std::round((xdt + Mode::ASTART) * FS2));
-        float smax = 0.0f;
-
-        for (int idt = i0 - Mode::NQSYMBOL; idt <= i0 + Mode::NQSYMBOL; ++idt) {
-            for (int ifr = -NFSRCH; ifr <= NFSRCH; ++ifr) {
-                float const delf = ifr * 0.5f;
-#ifdef JS8_BENCHMARK_ORIGINAL_COARSE_SYNC
-                float const candidateSync = syncjs8d(idt, delf);
-#else
-                float const candidateSync = syncjs8d<true>(
-                    idt, delf, &coarseCsyncs[ifr + NFSRCH]);
-#endif
-#ifdef JS8_BENCHMARK_VERIFY_COARSE_SYNC
-                float const originalSync = syncjs8d(idt, delf);
-                if (std::memcmp(&candidateSync, &originalSync,
-                                sizeof(candidateSync)) != 0)
-                    ++benchmarkSyncMismatches;
-#endif
-
-                if (candidateSync > smax) {
-                    smax = candidateSync;
-                    ibest = idt;
-                    delfbest = delf;
-                }
-            }
-        }
-
-        // Improved estimate for DT.
-
-        float const xdt2 = ibest * DT2;
-
-        // Refine frequency around the best 0.5 Hz grid point with 0.1 Hz
-        // spacing, keeping timing fixed at the jointly selected offset.
-
-        i0 = static_cast<int>(std::round(xdt2 * FS2));
-        float const coarseDelf = delfbest;
-        smax = 0.0f;
-
-        for (int ifr = -5; ifr <= 5; ++ifr) {
-            float const delf = coarseDelf + ifr * 0.1f;
-            float const candidateSync = syncjs8d(i0, delf);
-
-            if (candidateSync > smax) {
-                smax = candidateSync;
-                delfbest = delf;
-            }
+        int const initialStart =
+            static_cast<int>(std::round((xdt + Mode::ASTART) * FS2));
+        auto const fine = findFineSync(initialStart);
+        if (!fine)
+            return std::nullopt;
+        int const ibest = fine->start;
+        int const i0 = ibest;
+        float const delfbest = fine->residualHz;
+        float xdt2 = ibest * DT2;
+        if (decoder_js8().isDebugEnabled()) {
+            qCDebug(decoder_js8) << "fine acquisition"
+                << "coarseHz" << coarseStartHz << "initialStart" << initialStart
+                << "start" << fine->start << "residualHz" << fine->residualHz
+                << "coarseStepHz" << kCoarseHz << "fineStepHz" << kFineHz
+                << "evaluations" << fine->evaluations
+                << "extended" << fine->extended << "atBoundary" << fine->atBoundary;
         }
 
         // Frequency tweaking.
@@ -1681,7 +2091,7 @@ template <typename Mode> class DecodeMode {
             std::polar(1.0f, dphi);           // Step for phase rotation
         std::complex<float> w = {1.0f, 0.0f}; // Cumlative phase
 
-        for (int i = 0; i < NP2; ++i) {
+        for (int i = 0; i < Mode::NDFFT2; ++i) {
             w *= wstep;  // Update cumulative phase
             cd0[i] *= w; // Apply phase shift
         }
@@ -1693,17 +2103,18 @@ template <typename Mode> class DecodeMode {
 
         float const sync = syncjs8d(i0, 0.0f);
 
-        std::array<std::array<float, NN>, NROWS> s2;
+        std::array<std::array<float, NN>, NROWS> s2{};
         // Scaled complex tone bins kept alongside the magnitude matrix so the
-        // coherent likelihood path can use phases. `s2` is still populated
-        // exactly as before; `abs(complexS2)` reproduces it up to fp rounding.
-        std::array<std::array<std::complex<float>, NN>, NROWS> complexS2;
-        // Per-symbol phase metadata for tracker normalization: nominal
-        // (pre-tracker-shift) start, effective extraction displacement, and
-        // the FrequencyTracker estimate applied to that symbol.
-        std::array<int, NN> symbolBaseStarts;
-        std::array<int, NN> symbolTimingShifts;
-        std::array<float, NN> symbolTrackerHz;
+        // coherent likelihood path can use phases. For observed windows,
+        // `abs(complexS2)` reproduces `s2` up to fp rounding.
+        std::array<std::array<std::complex<float>, NN>, NROWS> complexS2{};
+        // Phase metadata: nominal start (including any accepted pilot clock
+        // model), local tracker displacement, and the exact applied frequency
+        // correction. First-pass and aided extraction share this convention.
+        std::array<double, NN> symbolBaseStarts{};
+        std::array<double, NN> symbolTimingShifts{};
+        std::array<float, NN> symbolTrackerHz{};
+        std::array<bool, NN> symbolValid{};
 
         js8::FrequencyTracker freqTracker;
         if (m_enableFreqTracking) {
@@ -1728,30 +2139,7 @@ template <typename Mode> class DecodeMode {
             [&](int expectedTone) -> std::optional<float> {
             if (!freqTracker.enabled())
                 return std::nullopt;
-
-            if (expectedTone < 0 || expectedTone + 1 >= Mode::NDOWNSPS)
-                return std::nullopt;
-
-            float const m0 = std::norm(csymb[expectedTone]);
-            float const mplus = std::norm(csymb[expectedTone + 1]);
-            float const mminus =
-                expectedTone > 0 ? std::norm(csymb[expectedTone - 1]) : 0.0f;
-
-            if (m0 <= 0.0f)
-                return std::nullopt;
-
-            float const ratio = m0 / (mplus + mminus + 1e-12f);
-            if (ratio < 1.5f)
-                return std::nullopt;
-
-            float const denom = mminus - 2.0f * m0 + mplus;
-            if (std::abs(denom) < 1e-9f)
-                return std::nullopt;
-
-            float delta = 0.5f * (mminus - mplus) / denom;
-            delta = std::clamp(delta, -0.5f, 0.5f);
-
-            return delta * (FS2 / Mode::NDOWNSPS);
+            return pilotResidualHz(expectedTone, FS2);
         };
 
         auto const logTracker = [&](char const *tag) {
@@ -1780,7 +2168,7 @@ template <typename Mode> class DecodeMode {
 
         auto const goertzelEnergy =
             [&](int start, int expectedTone) -> std::optional<float> {
-            if (start < 0 || start + Mode::NDOWNSPS > NP2)
+            if (!symbolWindowValid(start))
                 return std::nullopt;
 
             std::array<std::complex<float>, Mode::NDOWNSPS> tmp;
@@ -1791,17 +2179,7 @@ template <typename Mode> class DecodeMode {
                 freqTracker.apply(tmp.data(), Mode::NDOWNSPS);
             }
 
-            auto const wstep = std::polar(
-                1.0f, static_cast<float>(-TAU * expectedTone / Mode::NDOWNSPS));
-            auto phase = std::complex<float>{1.0f, 0.0f};
-            std::complex<float> acc{0.0f, 0.0f};
-
-            for (auto const &sample : tmp) {
-                acc += sample * std::conj(phase);
-                phase *= wstep;
-            }
-
-            return std::norm(acc);
+            return matchedToneEnergy(tmp, expectedTone);
         };
 
 #ifdef JS8_CPU_BENCHMARK
@@ -1817,23 +2195,23 @@ template <typename Mode> class DecodeMode {
                                         ? static_cast<int>(std::round(
                                               timingTracker.currentSamples()))
                                         : 0;
-            int i1 = i1Base + timingShift;
+            int const i1 = i1Base + timingShift;
 
-            if (i1 < 0) {
-                i1 = 0;
-            } else if (i1 + Mode::NDOWNSPS > NP2) {
-                i1 = NP2 - Mode::NDOWNSPS;
+            symbolBaseStarts[k] = i1Base;
+            symbolTimingShifts[k] = timingShift;
+            symbolTrackerHz[k] = freqTracker.enabled()
+                ? static_cast<float>(freqTracker.currentHz()) : 0.0f;
+            symbolValid[k] = symbolWindowValid(i1);
+            if (!symbolValid[k])
+                continue;
+
+            if (!js8::extractSymbolWindow(cd0.data(), m_basebandSamples, i1,
+                                           Mode::NDOWNSPS, csymb.data())) {
+                symbolValid[k] = false;
+                continue;
             }
-
-            csymb.fill(ZERO);
-
-            if (i1 >= 0 && i1 + Mode::NDOWNSPS <= NP2) {
-                std::copy(cd0.begin() + i1, cd0.begin() + i1 + Mode::NDOWNSPS,
-                          csymb.begin());
-
-                if (freqTracker.enabled()) {
-                    freqTracker.apply(csymb.data(), Mode::NDOWNSPS);
-                }
+            if (freqTracker.enabled()) {
+                freqTracker.apply(csymb.data(), Mode::NDOWNSPS);
             }
 
             fftwf_execute(plans[Plan::CS]);
@@ -1844,16 +2222,8 @@ template <typename Mode> class DecodeMode {
                 s2[i][k] = std::abs(csymb[i]) / 1000.0f;
             }
 
-            if (m_enableCoherentData) {
-                for (int i = 0; i < NROWS; ++i)
-                    complexS2[i][k] = csymb[i] / 1000.0f;
-                symbolBaseStarts[k] = i1Base;
-                symbolTimingShifts[k] = i1 - i1Base;
-                symbolTrackerHz[k] = freqTracker.enabled()
-                                         ? static_cast<float>(
-                                               freqTracker.currentHz())
-                                         : 0.0f;
-            }
+            for (int i = 0; i < NROWS; ++i)
+                complexS2[i][k] = csymb[i] / 1000.0f;
 
             if (freqTracker.enabled() || timingTracker.enabled()) {
                 bool const isPilot =
@@ -1906,6 +2276,13 @@ template <typename Mode> class DecodeMode {
         }
 #endif
 
+        auto const pilotModel=refinePilots(s2,complexS2,symbolBaseStarts,
+            symbolTimingShifts,symbolTrackerHz,symbolValid);
+        if (pilotModel) {
+            xdt2=static_cast<float>(symbolBaseStarts[0]/FS2);
+            xdt=xdt2;
+        }
+
         // Compute a soft Costas quality metric using all pilot-bin power. Keep
         // the legacy winner count for UI/debugging, but do not use it as the
         // acceptance gate.
@@ -1919,6 +2296,8 @@ template <typename Mode> class DecodeMode {
 
             for (std::size_t column = 0; column < 7; ++column) {
                 auto const symbolIndex = offset + column;
+                if (!symbolValid[symbolIndex])
+                    continue;
                 int const expectedTone = Costas[costas][column];
 
                 auto const max_row = std::distance(
@@ -1972,7 +2351,7 @@ template <typename Mode> class DecodeMode {
         // the decoder-aided re-demodulation use this same implementation.
         ToneBinLlrs const toneBins = processToneBins(
             s2, complexS2, symbolBaseStarts, symbolTimingShifts,
-            symbolTrackerHz);
+            symbolTrackerHz, symbolValid, pilotModel.has_value());
         auto llr0 = toneBins.llr0;
         auto llr1 = toneBins.llr1;
 
@@ -2036,8 +2415,8 @@ template <typename Mode> class DecodeMode {
             };
 
         // Explicit synchronization context for finalizing a successful
-        // decode. Normal call sites omit it and finalize with the existing
-        // f1/xdt2 exactly as before; the aided pass supplies its refined
+        // decode. Normal call sites use the accepted pilot model when present;
+        // the aided pass supplies its refined
         // physical estimate so reporting and SIC subtraction use the sync
         // that actually produced the success. Never mutated to trick the
         // path: failure behavior is identical with or without it.
@@ -2105,11 +2484,14 @@ template <typename Mode> class DecodeMode {
                 !(ipass > 2 && nharderrors > 39) &&
                 !(ipass == 4 && nharderrors > 30)) {
                 if (checkCRC12(decoded)) {
-                    // Success-only sync: normal decodes use f1/xdt2 exactly
-                    // as before; aided decodes use the supplied refined
+                    // One success-only context supplies the accepted physical
                     // estimate for both reporting and SIC seeding.
+                    double const midpoint=(symbolBaseStarts.front()+symbolBaseStarts.back()+
+                                           Mode::NDOWNSPS)*0.5/FS2;
+                    float const normalFrequency=f1+(pilotModel && m_enablePilotSmoothing &&
+                        m_enableFreqTracking ? static_cast<float>(pilotModel->frequencyAt(midpoint)) : 0.0f);
                     FinalizeSync const fs =
-                        finalize.value_or(FinalizeSync{f1, xdt2});
+                        finalize.value_or(FinalizeSync{normalFrequency, xdt2});
                     if (syncStats)
                         emitEvent(JS8::Event::SyncState{
                             JS8::Event::SyncState::Type::DECODED,
@@ -2128,7 +2510,7 @@ template <typename Mode> class DecodeMode {
                     JS8::encode(i3bit, Costas, message.data(), itone.data());
 
                     if (lsubtract)
-                        subtractjs8(genjs8refsig(itone, fs.frequencyHz),
+                        subtractjs8(genjs8refsig(itone, fs),
                                     fs.xdtSeconds);
 
                     float xsig = 0.0f;
@@ -2145,6 +2527,10 @@ template <typename Mode> class DecodeMode {
                     m_softCombiner.markDecoded(combined.key);
 
                     logTracker("decoded");
+                    if (!finalize && pilotModel) {
+                        f1=fs.frequencyHz;
+                        xdt=fs.xdtSeconds;
+                    }
                     return std::make_optional<Decode>(i3bit, message);
                 }
             } else {
@@ -2298,7 +2684,8 @@ template <typename Mode> class DecodeMode {
 
             bool const boundsOk =
                 tentValid && js8::aided::symbolBoundsValid(
-                                 aidedBaselines, Mode::NDOWNSPS, NP2,
+                                 aidedBaselines, Mode::NDOWNSPS,
+                                 m_basebandSamples,
                                  js8::aided::kTimingDeltaMax);
             // Gate reason for telemetry: 0 = searched, 1 = tentative
             // word/LLRs unusable, 2 = candidate sample bounds invalid.
@@ -2350,7 +2737,8 @@ template <typename Mode> class DecodeMode {
 #endif
                 js8::aided::Refinement const refinement =
                     js8::aided::refineSync(
-                        cd0.data(), NP2, aidedBaselines, Mode::NDOWNSPS,
+                        cd0.data(), m_basebandSamples, aidedBaselines,
+                        Mode::NDOWNSPS,
                         static_cast<double>(FS2), expectedTones, symWeights);
 #ifdef JS8_CPU_BENCHMARK
                 ++benchmarkRefineCalls;
@@ -2384,33 +2772,32 @@ template <typename Mode> class DecodeMode {
                     std::array<std::array<float, NN>, NROWS> s2Aided{};
                     std::array<std::array<std::complex<float>, NN>, NROWS>
                         complexAided{};
-                    std::array<int, NN> baseStartsAided{};
-                    std::array<int, NN> shiftsAided{};
+                    std::array<double, NN> baseStartsAided{};
+                    std::array<double, NN> shiftsAided{};
                     std::array<float, NN> trackerHzAided{};
+                    std::array<bool, NN> validAided{};
                     double const rateHz = static_cast<double>(FS2);
                     for (int k = 0; k < NN; ++k) {
                         std::size_t const kk = static_cast<std::size_t>(k);
-                        int const firstStart =
+                        double const firstStart =
                             aidedBaselines[kk].startSamples;
-                        int i1 = firstStart + aidedDt;
-                        if (i1 < 0) {
-                            i1 = 0;
-                        } else if (i1 + Mode::NDOWNSPS > NP2) {
-                            i1 = NP2 - Mode::NDOWNSPS;
-                        }
+                        double const i1 = firstStart + aidedDt;
+                        validAided[kk] = js8::fractionalWindowValid(i1,Mode::NDOWNSPS,m_basebandSamples);
+                        if (!validAided[kk])
+                            continue;
                         baseStartsAided[kk] = symbolBaseStarts[kk];
                         shiftsAided[kk] = i1 - symbolBaseStarts[kk];
                         trackerHzAided[kk] = symbolTrackerHz[kk];
-                        for (int n = 0; n < Mode::NDOWNSPS; ++n)
-                            csymb[static_cast<std::size_t>(n)] =
-                                cd0[static_cast<std::size_t>(i1 + n)];
-                        if (!js8::aided::replayTrackerCorrection(
+                        if (!js8::extractSymbolWindow(cd0.data(),m_basebandSamples,i1,
+                                                       Mode::NDOWNSPS,csymb.data()) ||
+                            !js8::aided::replayTrackerCorrection(
                                 csymb.data(), Mode::NDOWNSPS,
                                 aidedBaselines[kk].trackerHz, rateHz)) {
                             // Corrupt window: zero-fill so downstream
                             // finite/magnitude guards handle it
                             // deterministically.
                             csymb.fill(ZERO);
+                            validAided[kk]=false;
                         }
                         for (int n = 0; n < Mode::NDOWNSPS; ++n) {
                             double const t =
@@ -2444,7 +2831,7 @@ template <typename Mode> class DecodeMode {
                     // LLRs. Tentative data never enters the coherent fit.
                     ToneBinLlrs const aidedBins = processToneBins(
                         s2Aided, complexAided, baseStartsAided, shiftsAided,
-                        trackerHzAided);
+                        trackerHzAided, validAided, pilotModel.has_value());
                     aidedLlrNorm = js8::aided::llrNorm(aidedBins.llr0);
 
                     // Final physical sync if this attempt succeeds: the
@@ -2756,7 +3143,7 @@ template <typename Mode> class DecodeMode {
         std::size_t const NDD_SIZE = Mode::NDD + 1;
         std::size_t const RANGE_SIZE = it - ib + 1;
 
-        std::fill_n(cd0.begin(), Mode::NDFFT2, ZERO);
+        cd0.fill(ZERO);
 
         std::copy(ds_cx.begin() + ib, ds_cx.begin() + ib + RANGE_SIZE,
                   cd0.begin());
@@ -2794,7 +3181,7 @@ template <typename Mode> class DecodeMode {
         float const factor =
             1.0f / std::sqrt(static_cast<float>(Mode::NDFFT1) * Mode::NDFFT2);
 
-        std::transform(cd0.begin(), cd0.end(), cd0.begin(),
+        std::transform(cd0.begin(), cd0.begin() + Mode::NDFFT2, cd0.begin(),
                        [factor](auto &value) { return value * factor; });
     }
 
@@ -2877,13 +3264,20 @@ template <typename Mode> class DecodeMode {
         // Compute symbol spectra
 
         savg.fill(0.0f);
+        m_spectrumCount = std::clamp(
+            (m_receivedSamples - Mode::NFFT1) / Mode::NSTEP + 1,
+            0, Mode::NHSYM);
+        if (m_receivedSamples < Mode::NFFT1)
+            return {};
+        for (auto &row : s)
+            std::fill(row.begin() + m_spectrumCount, row.end(), 0.0f);
 
 #ifdef JS8_CPU_BENCHMARK
         {
             BenchmarkScope benchmarkScope{benchmarkSpectrumCalls,
                                           benchmarkSpectrumNanos};
 #endif
-        for (int j = 0; j < Mode::NHSYM; ++j) {
+        for (int j = 0; j < m_spectrumCount; ++j) {
             int const ia = j * Mode::NSTEP;
             int const ib = ia + Mode::NFFT1;
 
@@ -2910,6 +3304,11 @@ template <typename Mode> class DecodeMode {
 
         // Filter edge sanity measures
 
+        if (!std::any_of(savg.begin(), savg.end(), [](float power) {
+                return std::isfinite(power) && power > 0.0f;
+            }))
+            return {};
+
         int const nwin = nfb - nfa;
 
         if (nfa < 100) {
@@ -2927,6 +3326,8 @@ template <typename Mode> class DecodeMode {
         auto const ia =
             std::max(0, static_cast<int>(std::round(nfa / Mode::DF)));
         auto const ib = static_cast<int>(std::round(nfb / Mode::DF));
+        if (ia > ib)
+            return {};
 
         // Convert average spectrum from power to db scale and compute
         // baseline from it; baseline replaces average spectrum.
@@ -2934,6 +3335,8 @@ template <typename Mode> class DecodeMode {
         baselinejs8(ia, ib);
 
         // Compute and populate the sync index.
+        std::vector<float> frequencyMaxima;
+        frequencyMaxima.reserve(ib - ia + 1);
 
 #ifdef JS8_BENCHMARK_VERIFY_RANK_SCAN
         std::uint64_t comparedScores = 0;
@@ -2947,7 +3350,7 @@ template <typename Mode> class DecodeMode {
 
         for (int i = ia; i <= ib; ++i) {
             float max_value = -std::numeric_limits<float>::infinity();
-            int max_index = -Mode::JZ;
+            TimingScores timingScores{};
 
 #ifdef JS8_BENCHMARK_ORIGINAL_RANK_SCAN
             for (int j = -Mode::JZ; j <= Mode::JZ; ++j) {
@@ -2958,7 +3361,7 @@ template <typename Mode> class DecodeMode {
                         int const offset =
                             j + Mode::JSTRT + NSSY * n + p * 36 * NSSY;
 
-                        if (offset >= 0 && offset < Mode::NHSYM) {
+                        if (offset >= 0 && offset < m_spectrumCount) {
                             // Accumulate Costas pattern contributions.
 
                             t[0][p] += s[i + NFOS * Costas[p][n]][offset];
@@ -2989,16 +3392,16 @@ template <typename Mode> class DecodeMode {
                         t0 += t[1][i];
                     }
 
-                    return tx / ((t0 - tx) / 6.0f);
+                    float const noise = (t0 - tx) / 6.0f;
+                    return noise > 0.0f && std::isfinite(noise)
+                        ? tx / noise : 0.0f;
                 };
 
-                if (auto const sync_value =
-                        std::max({compute_sync(0, 2), compute_sync(0, 1),
-                                  compute_sync(1, 2)});
-                    sync_value > max_value) {
-                    max_value = sync_value;
-                    max_index = j;
-                }
+                float const sync_value =
+                    std::max({compute_sync(0, 2), compute_sync(0, 1),
+                              compute_sync(1, 2)});
+                timingScores[j + Mode::JZ] = sync_value;
+                max_value = std::max(max_value, sync_value);
             }
 #else
             // Each timing offset has independent accumulators. Visit the
@@ -3014,7 +3417,7 @@ template <typename Mode> class DecodeMode {
                     int const base = Mode::JSTRT + NSSY * n + p * 36 * NSSY;
                     int const first = std::max(-Mode::JZ, -base);
                     int const last =
-                        std::min(Mode::JZ, Mode::NHSYM - 1 - base);
+                        std::min(Mode::JZ, m_spectrumCount - 1 - base);
                     for (int j = first; j <= last; ++j)
                         byTiming[j + Mode::JZ][0][p] +=
                             s[i + NFOS * Costas[p][n]][j + base];
@@ -3034,7 +3437,9 @@ template <typename Mode> class DecodeMode {
                         tx += t[0][block];
                         t0 += t[1][block];
                     }
-                    return tx / ((t0 - tx) / 6.0f);
+                    float const noise = (t0 - tx) / 6.0f;
+                    return noise > 0.0f && std::isfinite(noise)
+                        ? tx / noise : 0.0f;
                 };
                 float const sync_value =
                     std::max({compute_sync(0, 2), compute_sync(0, 1),
@@ -3048,7 +3453,7 @@ template <typename Mode> class DecodeMode {
                     for (int n = 0; n < 7; ++n) {
                         int const offset =
                             j + Mode::JSTRT + NSSY * n + p * 36 * NSSY;
-                        if (offset >= 0 && offset < Mode::NHSYM) {
+                        if (offset >= 0 && offset < m_spectrumCount) {
                             original[0][p] +=
                                 s[i + NFOS * Costas[p][n]][offset];
                             for (int freq = 0; freq < 7; ++freq)
@@ -3063,7 +3468,9 @@ template <typename Mode> class DecodeMode {
                         tx += original[0][block];
                         t0 += original[1][block];
                     }
-                    return tx / ((t0 - tx) / 6.0f);
+                    float const noise = (t0 - tx) / 6.0f;
+                    return noise > 0.0f && std::isfinite(noise)
+                        ? tx / noise : 0.0f;
                 };
                 float const reference =
                     std::max({originalSync(0, 2), originalSync(0, 1),
@@ -3072,15 +3479,16 @@ template <typename Mode> class DecodeMode {
                     ++benchmarkRankMismatches;
                 ++comparedScores;
 #endif
-                if (sync_value > max_value) {
-                    max_value = sync_value;
-                    max_index = j;
-                }
+                timingScores[j + Mode::JZ] = sync_value;
+                max_value = std::max(max_value, sync_value);
             }
 #endif
 
-            sync.emplace(Mode::DF * i, Mode::TSTEP * (max_index + 0.5f),
-                         max_value);
+            if (std::isfinite(max_value)) {
+                frequencyMaxima.push_back(max_value);
+                for (auto const &peak : timingPeaks(Mode::DF * i, timingScores))
+                    sync.insert(peak);
+            }
         }
 #ifdef JS8_BENCHMARK_VERIFY_RANK_SCAN
         benchmarkRankComparedScores += comparedScores;
@@ -3096,61 +3504,18 @@ template <typename Mode> class DecodeMode {
         if (sync.empty())
             return {};
 
-        // Access the sync indices.
-
-        auto &freqIndex = sync.get<Tag::Freq>();
-        auto &rankIndex = sync.get<Tag::Rank>();
-        auto &syncIndex = sync.get<Tag::Sync>();
-
-        // Normalize to the 40th percentile using the frequency index,
-        // which is stable under sync value mutation. One thing to note
+        // Normalize to the 40th percentile of ONE maximum per frequency bin.
+        // Extra timing peaks must not change the reference population. The
+        // frequency index is stable under sync value mutation. One thing to note
         // here is that the Fortran version didn't seem to reliably
         // calculate the 40th percentile rank; sometimes high, other
         // times low, infrequently actually the 40th percentile value.
         // This method should be perfectly accurate in all cases.
 
-        auto const normalize =
-            [sync = rankIndex.nth(rankIndex.size() * 4 / 10)->sync](
-                Sync &entry) { entry.sync /= sync; };
+        if (!normalizeSync(frequencyMaxima))
+            return {};
 
-        for (auto it = freqIndex.begin(); it != freqIndex.end(); ++it) {
-            freqIndex.modify(it, normalize);
-        }
-
-        // Extract normal candidates first, while retaining a small bounded
-        // fallback band below ASYNCMIN. Because syncIndex is ordered from
-        // strongest to weakest, normal candidates always win duplicate
-        // suppression before a deep-search candidate can claim the same
-        // frequency neighborhood.
-
-        SyncCandidates candidates;
-
-        for (auto it = syncIndex.begin(); it != syncIndex.end();
-             it = syncIndex.begin()) {
-            if (std::isnan(it->sync) || it->sync < ASYNCDEEP)
-                break;
-
-            if (it->sync >= ASYNCMIN) {
-                if (candidates.normal.size() >= NMAXCAND)
-                    break;
-
-                candidates.normal.push_back(*it);
-            } else {
-                if (!m_enableDeepSearch || candidates.deep.size() >= NMAXDEEP)
-                    break;
-
-                candidates.deep.push_back(*it);
-            }
-
-            // Remove the candidate and any near-duplicates based on
-            // frequency. This invalidates `it`, so the loop restarts at the
-            // strongest remaining entry.
-
-            freqIndex.erase(freqIndex.lower_bound(it->freq - Mode::AZ),
-                            freqIndex.upper_bound(it->freq + Mode::AZ));
-        }
-
-        return candidates;
+        return extractSyncCandidates();
     }
 
     // Returns the total synchronization power, which is a measure of how well
@@ -3160,7 +3525,8 @@ template <typename Mode> class DecodeMode {
 
     template <bool Cached = false>
     float syncjs8d(int const i0, float const delf,
-                   SyncWaveforms const *const cached = nullptr) {
+                   SyncWaveforms const *const cached = nullptr,
+                   std::array<float, 3> *blockPowers = nullptr) {
 #ifdef JS8_CPU_BENCHMARK
         BenchmarkScope benchmarkScope{benchmarkSyncCalls, benchmarkSyncNanos};
 #endif
@@ -3171,6 +3537,8 @@ template <typename Mode> class DecodeMode {
             freqStep = std::polar(1.0f, dphi);
         }
         float syncPower = 0.0f;
+        int completeBlocks = 0;
+        if (blockPowers) blockPowers->fill(0.0f);
 
         // Correlate coherently across each full 7-symbol Costas block. Reset
         // the residual-frequency phase between blocks, then combine the three
@@ -3185,7 +3553,7 @@ template <typename Mode> class DecodeMode {
                 int const offset =
                     36 * block * Mode::NDOWNSPS + i0 + symbol * Mode::NDOWNSPS;
 
-                if (offset < 0 || offset + Mode::NDOWNSPS > Mode::NP2) {
+                if (!symbolWindowValid(offset)) {
                     complete = false;
                     break;
                 }
@@ -3203,11 +3571,17 @@ template <typename Mode> class DecodeMode {
                 }
             }
 
-            if (complete)
-                syncPower += std::norm(blockCorrelation);
+            if (complete) {
+                float const power = std::norm(blockCorrelation);
+                syncPower += power;
+                if (blockPowers) (*blockPowers)[block] = power;
+                ++completeBlocks;
+            }
         }
 
-        return syncPower;
+        // Equal expected noise scale for two- and three-block hypotheses.
+        // At least two complete blocks are required for reliable acquisition.
+        return completeBlocks >= 2 ? syncPower * (3.0f / completeBlocks) : 0.0f;
     }
 
     // Generate a reference signal, based on the provided tone sequence and
@@ -3500,6 +3874,8 @@ template <typename Mode> class DecodeMode {
             std::getenv("JS8_DISABLE_COHERENT_DATA") == nullptr;
         m_enableAidedRedemod =
             std::getenv("JS8_DISABLE_REDEMOD") == nullptr;
+        m_enablePilotSmoothing = std::getenv("JS8_DISABLE_PILOT_SMOOTHING") == nullptr;
+        m_enableFractionalTiming = std::getenv("JS8_DISABLE_FRACTIONAL_TIMING") == nullptr;
 
         // Intialize the Nuttal window. In theory, we can do this as a
         // constexpr function at compile time, but doing so yield results
@@ -3562,11 +3938,11 @@ template <typename Mode> class DecodeMode {
         }
 
         constexpr float FS2 = 12000.0f / Mode::NDOWN;
-        for (int ifr = -NFSRCH; ifr <= NFSRCH; ++ifr) {
-            float const delf = ifr * 0.5f;
+        for (int ifr = -kFineRadius; ifr <= kFineRadius; ++ifr) {
+            float const delf = ifr * kFineHz;
             float const dphi = TAU * delf / FS2;
             std::complex<float> const freqStep = std::polar(1.0f, dphi);
-            auto &references = coarseCsyncs[ifr + NFSRCH];
+            auto &references = syncReferences[ifr + kFineRadius];
             for (int block = 0; block < 3; ++block) {
                 std::complex<float> phase{1.0f, 0.0f};
                 for (int symbol = 0; symbol < 7; ++symbol) {
@@ -3675,10 +4051,15 @@ template <typename Mode> class DecodeMode {
                            int const ksz, JS8::Event::Emitter emitEvent) {
         // Copy the relevant frames for decoding
 
-        auto const pos = std::max(0, kpos);
-        auto const sz = std::max(0, ksz);
-
-        assert(sz <= Mode::NMAX);
+        auto const pos = std::clamp(kpos, 0, JS8_RX_SAMPLE_SIZE - 1);
+        auto const sz = std::clamp(ksz, 0, Mode::NMAX);
+        m_receivedSamples = sz;
+        // Complete decimation cells only. Generated FFT padding is never an
+        // observation; filtering can still affect boundary samples, which are
+        // exercised separately by partial-window replay tests.
+        m_basebandSamples = std::min(Mode::NDFFT2, sz / Mode::NDOWN);
+        if (sz == 0)
+            return 0;
 
         if (data.params.syncStats)
             emitEvent(JS8::Event::SyncStart{pos, sz});
@@ -3756,7 +4137,9 @@ template <typename Mode> class DecodeMode {
             bool improved = false;
 
             auto const tryCandidates = [&](auto const &candidateList) {
-                for (auto [f1, xdt, sync] : candidateList) {
+                for (auto const &candidate : candidateList) {
+                    float f1 = candidate.freq;
+                    float xdt = candidate.step;
                     float xsnr = 0.0f;
                     int nharderrors = -1;
 

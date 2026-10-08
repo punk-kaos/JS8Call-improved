@@ -928,20 +928,22 @@ SicRefinementResult refineSicReference(
 // argument to subtractjs8(). Dispatch on macro argument count lets us leave the
 // member definition structurally unchanged (its std::array<int, NN> parameter
 // is seen as three preprocessor arguments because of the template comma) while
-// wrapping the ordinary two-argument call with post-decode refinement.
+// wrapping a two-argument (tones, accepted synchronization) call with
+// post-decode refinement. The accepted context supplies BOTH frequency and
+// time, including fractional/pilot and aided changes; no hidden xdt2 seed.
 #define JS8_SIC_GENREF_SELECT(_1, _2, _3, NAME, ...) NAME
 #define JS8_SIC_GENREF_DEFINITION(_1, _2, _3) \
     genjs8refsigRaw(_1, _2, _3)
-#define JS8_SIC_GENREF_CALL(_itone, _f0)                                      \
+#define JS8_SIC_GENREF_CALL(_itone, _sync)                                    \
     ([&]() {                                                                  \
-        auto sicReference = genjs8refsigRaw(_itone, _f0);                    \
+        auto sicReference = genjs8refsigRaw(_itone, (_sync).frequencyHz);    \
         if (std::getenv("JS8_DISABLE_SIC_REFINEMENT") != nullptr)            \
             return sicReference;                                              \
         auto const allowTimingDrift =                                         \
             std::getenv("JS8_DISABLE_SIC_TIMING_DRIFT") == nullptr;          \
         auto sicRefinement =                                                  \
             ::js8::refineSicReference<Mode::NSPS, NN>(                       \
-                std::move(sicReference), dd, _itone, xdt2, allowTimingDrift);\
+                std::move(sicReference), dd, _itone, (_sync).xdtSeconds, allowTimingDrift);\
         if (decoder_js8().isDebugEnabled()) {                                \
             double const metricGainDb =                                      \
                 sicRefinement.nominalMetric > 0.0 &&                         \

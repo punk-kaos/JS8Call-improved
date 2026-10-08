@@ -29,6 +29,81 @@ In the tools directory there are the following shell scripts for linux:
   setting (not the matched-bin SNR used by llr_frame_benchmark). Both report
   only decoded frames whose payload matches the transmitted message.
 
+Acquisition/tracking correctness and replay (run from the repository root):
+
+- decoder_waveform_test.cpp validates deterministic AWGN, measured power,
+  full-band/2500-Hz SNR conversion, missing frame edges and PCM headroom.
+  Build: clang++ -std=c++20 -O2 tools/decoder_waveform_test.cpp -o /tmp/waveform_test
+  Run: /tmp/waveform_test
+
+- acquisition_test.cpp exercises the real decoder's pilot coverage, sample
+  bounds, missing-symbol noise/LLR neutrality, wrapped/partial input, stale
+  scratch, tracker sign, timing correlator and exact aided replay in all modes.
+- acquisition_diag.cpp runs all modes with bin-center/half-bin, early/late,
+  drift and partial-window scenarios through the production decoder. It emits
+  CSV with exact recovery, wrong-payload outputs, post-Costas-gate candidate
+  counts, frequency/timing errors, runtime and measured SNR. Combining is
+  disabled so repeated trials cannot reuse evidence. Use identical seeds and
+  trial counts for baseline/candidate comparisons. Its drift frequency error
+  is referenced to the frame midpoint; existing ordinary decoder output still
+  reports its bulk acquisition frequency, not a smoothed midpoint estimate.
+
+  Build either tool (replace TOOL and adjust the generated moc path):
+    clang++ -std=c++20 -O2 -I. -Ibuild/JS8Call_autogen/include \
+      $(pkg-config --cflags Qt6Core fftw3f) tools/TOOL.cpp \
+      JS8_Mode/FrequencyTracker.cpp \
+      build/JS8Call_autogen/33ZB6LRKMI/moc_JS8.cpp \
+      $(pkg-config --libs Qt6Core fftw3f) -lpthread -o /tmp/TOOL
+  Run: /tmp/acquisition_test
+       /tmp/acquisition_diag 100 -18
+       /tmp/acquisition_diag 32 -18 8192
+
+  acquisition_diag accepts [TRIALS [SETTING_DB [FIRST_SEED [impairments]]]], defaulting to
+  2, -24, 1234. The optional seed start supports separate validation sets.
+  JS8_ACQUISITION_TRACE=A:late enables per-seed decoder logging for that
+  mode/scenario only; traced timings must not be used for CPU comparisons.
+  Appending "impairments" adds negative drift, fractional arrival and ±300-ppm
+  sample-clock cases. Clock error stretches the transmitted waveform itself.
+  Its frequency-error truth uses drift relative to frame start, including the
+  clock-induced frequency scaling (the older start-time offset was incorrect).
+
+  Checkpoint D controls (presence disables a feature, including a value of 0):
+    JS8_DISABLE_PILOT_SMOOTHING=1   disables model-based frequency/drift steering
+    JS8_DISABLE_FRACTIONAL_TIMING=1 disables pilot timing/clock steering
+  The legacy trackers remain available as the conservative fallback. Disable
+  both for a C observation-path comparison; the aided-SIC context fix is always
+  active. New models are only accepted after pilot confidence/coverage checks
+  and fresh-extraction validation. See acquisition_progress.md for limits.
+
+  pilot_refinement_test.cpp is a standalone test of the pilot model and shared
+  fractional extractor, including both drift/clock signs and aliased tone phase.
+  Build: clang++ -std=c++20 -O2 -I. tools/pilot_refinement_test.cpp -o /tmp/pilot_test
+  Run: /tmp/pilot_test
+
+  Checkpoint A/B reference: build acquisition_diag with all three switches:
+    -DJS8_BENCHMARK_LEGACY_FINE_SYNC
+    -DJS8_BENCHMARK_SINGLE_TIMING_PEAK
+    -DJS8_BENCHMARK_FREQUENCY_ONLY_SUPPRESSION
+  Use the first switch alone to isolate timing-peak retention, or the last
+  two to isolate fine-search changes. These are diagnostic build switches.
+  They preserve the current sample-validity/tracker corrections.
+
+  For exact score verification, build acquisition_test with:
+    -DJS8_BENCHMARK_VERIFY_COARSE_SYNC -DJS8_BENCHMARK_VERIFY_RANK_SCAN
+  Add -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer for sanitizer
+  coverage. Test-local verification counters are provided by this harness;
+  JS8_CPU_BENCHMARK is supplied only when building decoder_cpu_benchmark.
+
+  decoder_waveform.h is shared by whitening_diag and acquisition_diag. The
+  historical synthesis setting assigns noise variance 10^(-setting/10) and a
+  unit-amplitude cosine (power approximately 0.5), so full-band sample SNR is
+  approximately setting-3.0103 dB. SNR2500 adds 10*log10(6000/2500) dB. The
+  generator now scales the complete signal+noise uniformly into PCM headroom
+  without clipping and transmits only within the actual 79-symbol frame.
+  Older overflowing waveform benchmark results are not directly comparable.
+  Replay timings exclude construction but include waveform decoding/SIC;
+  use decoder_cpu_benchmark for steady-state five-mode workload measurements.
+
 - decoder_cpu_benchmark.cpp replays a deterministic 90-second 12-kHz ring
   containing tiled A/E WAV fixtures from media/tests, weak competing carriers,
   and fixed-seed noise through one persistent five-mode JS8 decoder worker.

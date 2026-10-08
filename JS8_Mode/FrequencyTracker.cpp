@@ -74,7 +74,7 @@ void FrequencyTracker::apply(std::complex<float> *data, int count) const {
     if (!m_enabled || !data || count <= 0 || m_fs <= 0.0)
         return;
 
-    double const dphi = 2.0 * std::numbers::pi * (m_est_hz / m_fs);
+    double const dphi = -2.0 * std::numbers::pi * (m_est_hz / m_fs);
     auto const wstep = std::polar(1.0f, static_cast<float>(dphi));
     auto w = std::complex<float>{1.0f, 0.0f};
 

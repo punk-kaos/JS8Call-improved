@@ -57,7 +57,7 @@ class FrequencyTracker {
     [[nodiscard]] double averageStepHz() const noexcept;
 
     /**
-     * @brief Rotate an array of complex samples by the tracked frequency.
+     * @brief Remove the estimated physical residual using a negative rotation.
      * @param data Pointer to complex input/output samples to be rotated in-place.
      * @param count Number of complex samples.
      */

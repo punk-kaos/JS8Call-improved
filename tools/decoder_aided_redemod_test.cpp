@@ -179,10 +179,9 @@ js8::aided::Refinement originalRefineSync(
             float const w = weights[k];
             if (!(w > 0.0f))
                 continue;
-            int const start = baselines[k].startSamples + dt;
-            for (int n = 0; n < window; ++n)
-                replayed[n] = samples[start + n];
-            if (!replayTrackerCorrection(replayed, window,
+            double const start = baselines[k].startSamples + dt;
+            if (!js8::extractSymbolWindow(samples,numSamples,start,window,replayed) ||
+                !replayTrackerCorrection(replayed, window,
                                          baselines[k].trackerHz, sampleRateHz))
                 continue;
             double binRe[kTones] = {};
@@ -264,7 +263,7 @@ void runCachedSearchParity() {
             std::array<int, 79> tones{};
             std::array<float, 79> weights{};
             for (int k = 0; k < 79; ++k) {
-                baselines[k] = {64 + k * window, (k % 5 - 2) * 0.17f};
+                baselines[k] = {static_cast<double>(64 + k * window), (k % 5 - 2) * 0.17f};
                 tones[k] = static_cast<int>(rng() % 8);
                 weights[k] = k % 4 == 0 ? 0.0f : (k % 3 + 1) * 0.25f;
             }
@@ -640,7 +639,7 @@ void runTrackedBaseline() {
     check(untracked.best.metric > untracked.baselineMetric * 1.005,
           "control: untracked baseline shows real gain");
     auto const tracked =
-        runSearch(line, makeBaselines(kFrameStart, 2, -0.4f), tones, w);
+        runSearch(line, makeBaselines(kFrameStart, 2, 0.4f), tones, w);
     check(tracked.searched, "tracked baseline is searched");
     check(tracked.best.deltaSamples >= -1 && tracked.best.deltaSamples <= 1 &&
               tracked.best.deltaHz == 0.0 &&
@@ -672,6 +671,27 @@ void runWrongCodeword() {
     check(out.searched, "wrong-word input still searches safely");
     check(!js8::aided::refinementAccepted(out),
           "wrong tentative word cannot pass the gain gate");
+}
+
+void runFractionalBaseline() {
+    std::printf("[fractional baseline replay]\n");
+    std::array<int8_t,174> cw{};
+    for (int i=0; i<174; ++i) cw[i]=static_cast<int8_t>((i*40503u>>7)&1);
+    auto const tones=tonesFromBits(cw);
+    auto const line=synthLine(tones,kFrameStart,0.375,0.7,0.4,0.0);
+    auto baselines=makeBaselines(kFrameStart,0,0.4f);
+    for (auto &b:baselines) b.startSamples+=0.375;
+    auto const weights=unitDataWeights();
+    auto const current=runSearch(line,baselines,tones,weights);
+    auto const original=originalRefineSync(line.data(),static_cast<int>(line.size()),
+                                    baselines,kWindow,kRate,tones,weights);
+    check(current.searched && current.best.metric==original.best.metric &&
+          current.baselineMetric==original.baselineMetric &&
+          current.best.deltaSamples==original.best.deltaSamples &&
+          current.best.deltaHz==original.best.deltaHz,
+          "cached and direct scorers replay fractional starts identically");
+    check(!js8::aided::refinementAccepted(current),
+          "already aligned fractional baseline claims no artificial gain");
 }
 
 void runBoundsClipping() {
@@ -816,24 +836,23 @@ void runFinalizeTrackerDisabled() {
 
 void runFinalizePerfectTracker() {
     std::printf("[finalize perfect tracker]\n");
-    // Physical +0.4, tracker recorded -0.4 (mirror convention: replay adds
-    // the recorded value, so a correcting tracker holds -residual),
+    // Physical +0.4, tracker recorded +0.4 (replay removes the residual),
     // aidedDf ~= 0.
     auto const out = js8::aided::aidedPhysicalResidualAtMidpoint(
-        0.0, 0.0, makeTrackedBaselines(-0.4f), kWindow, kRate,
+        0.0, 0.0, makeTrackedBaselines(0.4f), kWindow, kRate,
         costasOnlyUnitWeights());
     check(out.valid, "midpoint fit valid");
     check(std::abs(out.residualHz - 0.4) < 1.0e-6,
           "perfect tracker still yields physical +0.4 Hz");
-    check(std::abs(out.trackerHzAtMid + 0.4) < 1.0e-6,
-          "midpoint tracker value recovered as -0.4");
+    check(std::abs(out.trackerHzAtMid - 0.4) < 1.0e-6,
+           "midpoint tracker value recovered as +0.4");
 }
 
 void runFinalizePartialTracker() {
     std::printf("[finalize partial tracker]\n");
-    // Physical +0.4, tracker recorded -0.25, aidedDf = +0.15.
+    // Physical +0.4, tracker recorded +0.25, aidedDf = +0.15.
     auto const out = js8::aided::aidedPhysicalResidualAtMidpoint(
-        0.15, 0.0, makeTrackedBaselines(-0.25f), kWindow, kRate,
+        0.15, 0.0, makeTrackedBaselines(0.25f), kWindow, kRate,
         costasOnlyUnitWeights());
     check(out.valid, "midpoint fit valid");
     check(std::abs(out.residualHz - 0.4) < 1.0e-6,
@@ -842,9 +861,9 @@ void runFinalizePartialTracker() {
 
 void runFinalizeNegativeFrequency() {
     std::printf("[finalize negative frequency]\n");
-    // Mirror of the perfect-tracker case: physical -0.4, tracker +0.4.
+    // Mirror of the perfect-tracker case: physical -0.4, tracker -0.4.
     auto const out = js8::aided::aidedPhysicalResidualAtMidpoint(
-        0.0, 0.0, makeTrackedBaselines(0.4f), kWindow, kRate,
+        0.0, 0.0, makeTrackedBaselines(-0.4f), kWindow, kRate,
         costasOnlyUnitWeights());
     check(out.valid, "midpoint fit valid");
     check(std::abs(out.residualHz + 0.4) < 1.0e-6,
@@ -949,6 +968,7 @@ int main() {
     runDriftHandling();
     runOtherSevenTones();
     runTrackedBaseline();
+    runFractionalBaseline();
     runFinalizeTiming();
     runFinalizeTrackerDisabled();
     runFinalizePerfectTracker();

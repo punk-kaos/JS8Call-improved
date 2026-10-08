@@ -18,7 +18,10 @@
 // time (fractional source-coordinate evaluation), not just tone phase.
 //
 // Build example (adjust Qt/FFTW paths as needed):
-//   g++ -std=c++17 -O2 -I.. tools/whitening_diag.cpp FrequencyTracker.cpp -lQt5Core -lfftw3f -lpthread
+//   clang++ -std=c++20 -O2 -I. -Ibuild/JS8Call_autogen/include \
+//     $(pkg-config --cflags Qt6Core fftw3f) tools/whitening_diag.cpp \
+//     JS8_Mode/FrequencyTracker.cpp build/JS8Call_autogen/33ZB6LRKMI/moc_JS8.cpp \
+//     $(pkg-config --libs Qt6Core fftw3f) -o /tmp/whitening_diag
 //
 // Note: this links only the pieces needed for decoding; it defines the
 // globals (dec_data, specData, fftw_mutex) that JS8 expects.
@@ -44,6 +47,7 @@
 
 #include "JS8_Include/commons.h"
 #include "JS8_Mode/JS8.h"
+#include "decoder_waveform.h"
 
 // Provide the globals expected by JS8.cpp
 struct dec_data dec_data;
@@ -81,50 +85,13 @@ namespace
         int tones[NN] = {};
         JS8::encode(0, JS8::Costas::array(Mode::NCOSTAS), message, tones);
 
-        constexpr double fs   = 12000.0;
-        constexpr double baud = fs / Mode::NSPS;
-
-        std::vector<float> samples(Mode::NMAX, 0.0f);
-
-        double snrLin   = std::pow(10.0, cfg.snrDb / 10.0);
-        double noiseVar = (snrLin > 0.0) ? (1.0 / snrLin) : 1.0;
-        std::mt19937 rng(cfg.seed);
-        std::normal_distribution<double> noise(0.0, std::sqrt(noiseVar));
-
-        // Real timing displacement: each output sample is evaluated at the
-        // shifted source coordinate s = idx - timingShiftSmpl, so FSK symbol
-        // boundaries genuinely move in time (fractional shifts supported,
-        // positive and negative). Carrier phase accumulates sequentially and
-        // stays continuous; the tone phase advances fractionally within the
-        // symbol, which is exact for pure tones, with no phase reset at
-        // boundaries (an integer tone advances by a multiple of 2*pi per
-        // symbol). Out-of-frame edges extend the edge symbols.
-        double phi = cfg.startPhase;
-
-        for (std::size_t idx = 0; idx < samples.size(); ++idx)
-        {
-            double const s = static_cast<double>(idx) - cfg.timingShiftSmpl;
-            long sym = static_cast<long>(
-                std::floor(s / static_cast<double>(Mode::NSPS)));
-            if (sym < 0)
-                sym = 0;
-            if (sym >= NN)
-                sym = NN - 1;
-            double const centerTime = (s >= 0.0 ? s : 0.0) / fs;
-            double const freq = cfg.baseHz + tones[sym] * baud +
-                                cfg.freqOffsetHz +
-                                cfg.driftHzPerSec * centerTime;
-            double const dphi = 2.0 * M_PI * freq / fs;
-            phi = std::fmod(phi + dphi, 2.0 * M_PI);
-            samples[idx] = static_cast<float>(std::cos(phi) + noise(rng));
-        }
-
-        auto const count = std::min(samples.size(), std::size_t(JS8_RX_SAMPLE_SIZE));
-        for (std::size_t i = 0; i < count; ++i)
-        {
-            dec_data.d2[i] = static_cast<std::int16_t>(std::round(samples[i] * 2000.0));
-        }
-
+        auto const waveform = js8::test::synthesize(
+            tones, Mode::NSPS, Mode::NMAX, cfg.snrDb, cfg.baseHz,
+            cfg.startPhase, cfg.freqOffsetHz, cfg.driftHzPerSec,
+            cfg.timingShiftSmpl, cfg.seed);
+        auto const count = std::min(waveform.samples.size(),
+                                    std::size_t(JS8_RX_SAMPLE_SIZE));
+        std::copy_n(waveform.samples.begin(), count, dec_data.d2);
         return count;
     }
 

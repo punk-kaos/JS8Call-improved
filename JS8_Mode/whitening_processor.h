@@ -82,6 +82,8 @@ template <int NROWS, int ND, int N> class WhiteningProcessor {
      * @param llrScale One fixed multiplier shared by every frame. Applied
      *        before erasure; must be positive and finite.
      * @param normalization Optional old per-frame normalization for benchmarks.
+     * @param symbolValid Optional observation mask; missing symbols supply zero
+     *        information and are excluded from noise estimation.
      * @return A `Result` containing `llr0`, `llr1` and processing statistics.
      */
     static Result process(std::array<std::array<float, ND>, NROWS> const &s1,
@@ -90,7 +92,8 @@ template <int NROWS, int ND, int N> class WhiteningProcessor {
                           std::optional<CoherentBlend<NROWS, ND>> const
                               &coherentBlend = std::nullopt,
                           float llrScale = 1.0f,
-                          Normalization normalization = Normalization::None) {
+                          Normalization normalization = Normalization::None,
+                          std::array<bool, ND> const *symbolValid = nullptr) {
         if (!(llrScale > 0.0f) || !std::isfinite(llrScale))
             llrScale = 1.0f;
         auto const median =
@@ -122,6 +125,8 @@ template <int NROWS, int ND, int N> class WhiteningProcessor {
 
             // Collect non-winning magnitudes for each tone.
             for (int j = 0; j < ND; ++j) {
+                if (symbolValid && !(*symbolValid)[j])
+                    continue;
                 int const winner = symbolWinners[j];
 
                 for (int i = 0; i < NROWS; ++i) {
@@ -164,6 +169,10 @@ template <int NROWS, int ND, int N> class WhiteningProcessor {
             noise.reserve(ND);
 
             for (int j = 0; j < ND; ++j) {
+                if (symbolValid && !(*symbolValid)[j]) {
+                    noise.push_back(0.0f);
+                    continue;
+                }
                 std::vector<float> bins;
                 bins.reserve(NROWS - 1);
 
@@ -234,6 +243,10 @@ template <int NROWS, int ND, int N> class WhiteningProcessor {
         std::size_t erasures = 0;
 
         for (int j = 0; j < ND; ++j) {
+            // Missing observations must not affect noise estimates or acquire
+            // evidence from coherent-model numerators. Result is zero-filled.
+            if (symbolValid && !(*symbolValid)[j])
+                continue;
             int const i1 = 3 * j;     // First column (matches Fortran's i1)
             int const i2 = 3 * j + 1; // Second column (matches Fortran's i2)
             int const i4 = 3 * j + 2; // Third column (matches Fortran's i4)
