@@ -58,3 +58,42 @@
 
     Under no circumstances submit PR's to a release candidate branch to get your latest and greatest feature into it, change
     libraries, etc.. New features go to main, only bug fixes are submitted to a release candidate.
+
+#  Where code belongs
+-   **Read the code documentation first.**
+    The generated documentation at https://js8call.com/JS8Call-improved/ describes what each class does and which of its
+    member functions own which job. Check it before adding code. To read it offline, generate it from your clone with
+    `.github/workflows/misc/Doxyfile`; `docs/DOXYGEN.md` shows how.
+
+-   **Extend before you add.**
+    Before writing a new function, check whether an existing one already owns the concern and extend that instead; do not
+    create a second path for the same job. A new function needs a reason, such as more than one caller or moving code out
+    of a large file (see below). New API code, commands and outbound events alike, belongs in
+    `UI_Constructor::networkMessage()` (`JS8_Mainwindow/networkMessage.cpp`).
+
+-   **The largest hand-written files are closed to substantial new code.**
+    `JS8_UI/mainwindow.cpp`, `JS8_UI/Configuration.cpp` and `JS8_Mode/JS8.cpp` have grown to the point where adding to them
+    makes them harder to maintain and harder to review. If a change wants more than a few dozen lines in any of these,
+    extract the new code before you write it, not after review. Editing logic that is already there is fine; adding a new
+    body of it is not.
+
+    There are two established places for it, both already visible in the directory layout.
+
+-   **Window logic that needs the window's own state goes in `JS8_Mainwindow/`.**
+    One file per member function, named after the function - `processRxActivity.cpp`, `displayCallActivity.cpp`,
+    `pushNotificationHandler.cpp` and fourteen more. Declare the method in `JS8_UI/mainwindow.h`, define it in its own file
+    under `JS8_Mainwindow/`, and add the file to `CMakeLists.txt`.
+
+-   **Code that owns state of its own goes in a class under `JS8_Main/`.**
+    Add `JS8_Main/<ClassName>.{h,cpp}`, hold it as an owning member of whatever uses it, delegate to it in a single line at
+    the call site, and add the `.cpp` to `CMakeLists.txt`. `Inbox`, `APRSISClient` and `Bands` are existing examples. Prefer
+    this whenever the new code has data of its own to keep - reserve a `JS8_Mainwindow/` member for logic that genuinely
+    needs the window's guts.
+
+#  Documentation
+-   **Document what you add, and keep functions small enough to review.**
+    Every new or changed function included in the generated documentation gets a Doxygen `/** */` block. An undocumented
+    override may inherit its base declaration's block, and excluded implementation details need a block only where it
+    helps a maintainer. A large function is split into helpers rather than submitted as one long body for a reviewer to
+    work through. `docs/DOXYGEN.md` covers what this project's Doxyfile expects of a block, and how to check yours locally
+    before submitting it.

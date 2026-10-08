@@ -91,32 +91,19 @@ include(GNUInstallDirs)
 # Options and features. Some of these directly affect compilation by being
 # define in js8call_config.h.in, which makes them available to the C/C++
 # preprocessor.
+# To enable ASAN use the CMake configure flags
+# -DCMAKE_BUILD_TYPE=Debug
+# -DJS8_ENABLE_ASAN=ON
 #------------------------------------------------------------------------------#
 
-option(WSJT_QDEBUG_TO_FILE     "Redirect Qt debugging messages to a trace file.")
-option(WSJT_HAMLIB_TRACE       "Debugging option that turns on minimal Hamlib internal diagnostics.")
-option(WSJT_RIG_NONE_CAN_SPLIT "Allow split operation with \"None\" as rig.")
+option(JS8_ENABLE_ASAN "Build with AddressSanitizer" OFF)
 
-cmake_dependent_option(
-  WSJT_HAMLIB_VERBOSE_TRACE
-  "Debugging option that turns on full Hamlib internal diagnostics."
-  OFF
-  WSJT_HAMLIB_TRACE
-  OFF)
+if(JS8_ENABLE_ASAN)
+    add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=address)
+endif()
 
-cmake_dependent_option(
-  WSJT_QDEBUG_IN_RELEASE
-  "Leave Qt debugging statements in Release configuration."
-  OFF
-  "NOT (CMAKE_BUILD_TYPE STREQUAL Debug)"
-  OFF)
-
-cmake_dependent_option(
-  WSJT_ENABLE_EXPERIMENTAL_FEATURES
-  "Enable features not fully ready for public releases."
-  ON
-  "CMAKE_BUILD_TYPE STREQUAL Debug"
-  OFF)
+option(JS8_RIG_NONE_CAN_SPLIT "Allow split operation with \"None\" as rig.")
 
 #------------------------------------------------------------------------------#
 # Ensure we have required library dependencies; we'll need headers from the
@@ -126,7 +113,7 @@ cmake_dependent_option(
 find_package(Boost 1.77 REQUIRED)
 find_package(FFTW3      REQUIRED COMPONENTS single threads)
 find_package(Hamlib     REQUIRED)
-find_package(Qt6   6.11 REQUIRED COMPONENTS Multimedia Network SerialPort Widgets WebSockets)
+find_package(Qt6   6.12 REQUIRED COMPONENTS Multimedia Network SerialPort Widgets WebSockets)
 
 include_directories(${Boost_INCLUDE_DIRS})
 include_directories(${FFTW3_INCLUDE_DIRS})
@@ -328,7 +315,6 @@ target_sources(
   JS8_Mainwindow/processBufferedActivity.cpp
   JS8_Mainwindow/processCommandActivity.cpp
   JS8_Mainwindow/processDecodeEvent.cpp
-  JS8_Mainwindow/processHeartbeatRateLimit.cpp
   JS8_Mainwindow/pushNotificationHandler.cpp
   JS8_Mainwindow/processRxActivity.cpp
   JS8_Mainwindow/UI_Constructor.cpp
